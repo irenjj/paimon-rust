@@ -16,6 +16,8 @@
 # under the License.
 
 [package]
+autotests = false
+autoexamples = false
 name = "paimon-datafusion"
 edition.workspace = true
 version.workspace = true
@@ -32,37 +34,35 @@ keywords = ["paimon", "datafusion", "integrations"]
 vortex = ["paimon/vortex"]
 
 [dependencies]
+arrow = { workspace = true }
+sqlparser = { version = "0.63.0", default-features = false, features = ["std", "visitor"] }
 arrow-select = { workspace = true }
 async-trait = "0.1"
-base64 = "0.22"
-bigdecimal = "0.4"
-cap-std = "4.0.3"
-chrono = "0.4"
-constant_time_eq = { workspace = true }
-datafusion = { workspace = true }
-datafusion-spark = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-session = { workspace = true }
+datafusion-catalog = { workspace = true }
+datafusion-datasource = { workspace = true }
+datafusion-datasource-parquet = { workspace = true }
+datafusion-execution = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+datafusion-physical-expr = { workspace = true }
+datafusion-physical-expr-common = { workspace = true }
+datafusion-physical-expr-adapter = { workspace = true }
+datafusion-functions-nested = { workspace = true }
 log = "0.4"
-paimon = { workspace = true }
+paimon = { workspace = true, features = ["storage-memory", "storage-fs"] }
 futures = "0.3"
-glob = "0.3"
-regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "fs"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 [dev-dependencies]
-arrow-array = { workspace = true }
-arrow-schema = { workspace = true }
-axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
-bytes = "1.7.1"
+chrono = "0.4"
+datafusion-functions = { workspace = true, features = ["string_expressions"] }
 flate2 = "1"
-opendal = { package = "opendal-core", version = "0.59.5", features = ["services-memory"] }
-paimon-ftindex-core = "0.2.0"
 parquet = { workspace = true }
 tar = "0.4"
 tempfile = "3"

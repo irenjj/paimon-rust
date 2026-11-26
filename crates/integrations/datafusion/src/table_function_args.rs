@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::common::ScalarValue;
-use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::Expr;
+use datafusion_common::ScalarValue;
+use datafusion_common::{DataFusionError, Result as DFResult};
+use datafusion_expr::Expr;
 use paimon::catalog::Identifier;
 
 pub(crate) fn extract_string_literal(

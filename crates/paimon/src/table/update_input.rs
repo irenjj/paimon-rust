@@ -366,7 +366,7 @@ fn cast_map_entries(
     }
     let (columns, offsets) =
         cast_map_columns(input, [fields[0].data_type(), fields[1].data_type()], mode)?;
-    let length = *offsets.last().unwrap() as usize;
+    let length = offsets.last() as usize;
     let entries = StructArray::try_new_with_length(fields.clone(), columns.into(), None, length)
         .map_err(|error| invalid(error.to_string()))?;
     Ok((entries, offsets))

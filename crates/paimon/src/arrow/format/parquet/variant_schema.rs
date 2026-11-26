@@ -111,9 +111,7 @@ fn annotated_column(arrow: &FieldRef, physical: &DataField, logical: &DataField)
 
 fn with_id(field: &FieldRef, data_type: ArrowDataType, id: i32) -> FieldRef {
     let mut field = field.as_ref().clone().with_data_type(data_type);
-    field
-        .metadata_mut()
-        .insert(FIELD_ID_KEY.into(), id.to_string());
+    field.metadata_mut().insert(FIELD_ID_KEY, id.to_string());
     Arc::new(field)
 }
 

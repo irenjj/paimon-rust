@@ -31,19 +31,18 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use arrow::array::Array;
+use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef as ArrowSchemaRef};
 use async_trait::async_trait;
-use datafusion::arrow::array::Array;
-use datafusion::arrow::datatypes::{
-    DataType as ArrowDataType, Field, Schema, SchemaRef as ArrowSchemaRef,
-};
-use datafusion::catalog::{Session, TableFunctionImpl};
-use datafusion::common::{project_schema, ScalarValue};
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
+use datafusion_catalog::TableProvider;
+use datafusion_catalog::{TableFunctionArgs, TableFunctionImpl};
+use datafusion_common::{project_schema, ScalarValue};
+use datafusion_common::{DataFusionError, Result as DFResult};
+use datafusion_expr::TableType;
+use datafusion_expr::{Expr, TableProviderFilterPushDown};
+use datafusion_physical_plan::empty::EmptyExec;
+use datafusion_physical_plan::ExecutionPlan;
+use datafusion_session::Session;
 use paimon::catalog::Catalog;
 use paimon::spec::{
     BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
@@ -60,30 +59,16 @@ use crate::table_function_args::{
     extract_int_literal, extract_string_literal, parse_table_identifier,
 };
 use crate::table_loader::load_data_table_for_read;
+use crate::DynamicOptions;
 
 const FUNCTION_NAME: &str = "hybrid_search";
 const SEARCH_SCORE_COLUMN: &str = "__paimon_search_score";
 
-pub fn register_hybrid_search(
-    ctx: &SessionContext,
-    catalog: Arc<dyn Catalog>,
-    default_database: &str,
-) {
-    ctx.register_udf(
-        datafusion::functions_nested::make_array::make_array_udf()
-            .as_ref()
-            .clone()
-            .with_aliases(["array"]),
-    );
-    ctx.register_udtf(
-        FUNCTION_NAME,
-        Arc::new(HybridSearchFunction::new(catalog, default_database)),
-    );
-}
-
+/// Table function implementation for `hybrid_search`.
 pub struct HybridSearchFunction {
     catalog: Arc<dyn Catalog>,
     default_database: String,
+    dynamic_options: DynamicOptions,
 }
 
 impl Debug for HybridSearchFunction {
@@ -95,16 +80,28 @@ impl Debug for HybridSearchFunction {
 }
 
 impl HybridSearchFunction {
+    /// Creates the `hybrid_search` table function.
     pub fn new(catalog: Arc<dyn Catalog>, default_database: &str) -> Self {
+        Self::new_with_dynamic_options(catalog, default_database, Default::default())
+    }
+
+    /// Creates a table function that applies shared Paimon read options.
+    pub fn new_with_dynamic_options(
+        catalog: Arc<dyn Catalog>,
+        default_database: &str,
+        dynamic_options: DynamicOptions,
+    ) -> Self {
         Self {
             catalog,
             default_database: default_database.to_string(),
+            dynamic_options,
         }
     }
 }
 
 impl TableFunctionImpl for HybridSearchFunction {
-    fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs<'_, '_>) -> DFResult<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != 4 && args.len() != 5 {
             return Err(DataFusionError::Plan(
                 "hybrid_search requires 4 or 5 arguments: (table_name, vector_routes, full_text_routes, limit[, ranker])".to_string(),
@@ -132,8 +129,19 @@ impl TableFunctionImpl for HybridSearchFunction {
         let identifier =
             parse_table_identifier(FUNCTION_NAME, &table_name, &self.default_database)?;
         let catalog = Arc::clone(&self.catalog);
+        let options = self.dynamic_options.read().unwrap().clone();
         let table = block_on_with_runtime(
-            async move { load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await },
+            async move {
+                let table = load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await?;
+                if options.is_empty() {
+                    Ok(table)
+                } else {
+                    table
+                        .copy_with_time_travel(options)
+                        .await
+                        .map_err(to_datafusion_error)
+                }
+            },
             "hybrid_search: catalog access thread panicked",
         )?;
 
@@ -211,7 +219,7 @@ impl TableProvider for HybridSearchTableProvider {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -248,7 +256,7 @@ impl HybridSearchTableProvider {
     async fn scan_search_result(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         result: GlobalIndexResult,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let search_result = result.row_ids().map_err(to_datafusion_error)?;
@@ -282,7 +290,7 @@ impl HybridSearchTableProvider {
             .position(|field| field.name() == ROW_ID_FIELD_NAME)
             .expect("search read fields contain _ROW_ID");
         let projected_indices = projection
-            .cloned()
+            .map(<[usize]>::to_vec)
             .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
         let mut input_projection = projected_indices
             .iter()
@@ -907,10 +915,8 @@ fn is_function(actual: &str, expected: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{
-        ArrayRef, Float32Array, Float32Builder, Int32Array, ListBuilder,
-    };
-    use datafusion::arrow::record_batch::RecordBatch;
+    use arrow::array::{ArrayRef, Float32Array, Float32Builder, Int32Array, ListBuilder};
+    use arrow::record_batch::RecordBatch;
     use paimon::catalog::Identifier;
     use paimon::spec::{ArrayType, FloatType, IntType, Schema as PaimonSchema};
     use paimon::{CatalogOptions, FileSystemCatalog, Options};
@@ -993,16 +999,16 @@ mod tests {
 
         // Publish a replacement after ranking and before planning the row read.
         commit_row(&table, 20, true).await;
-        let ctx = SessionContext::new();
+        let state = crate::test_session::TestSession::new(Default::default());
         let projection = vec![
             provider.schema.index_of("id").unwrap(),
             provider.schema.index_of(SEARCH_SCORE_COLUMN).unwrap(),
         ];
         let plan = provider
-            .scan_search_result(&ctx.state(), Some(&projection), ranked)
+            .scan_search_result(&state, Some(&projection), ranked)
             .await
             .unwrap();
-        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        let batches = datafusion_physical_plan::collect(plan, state.task_ctx())
             .await
             .unwrap();
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);

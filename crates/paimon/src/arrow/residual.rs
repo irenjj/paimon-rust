@@ -730,9 +730,8 @@ fn evaluate_array_membership_predicate(
                 )
             }
             ListLayout::Fixed(list) => {
-                let start = usize::try_from(list.value_offset(row));
-                let end = usize::try_from(list.value_offset(row) + list.value_length());
-                (start, end)
+                let start = list.value_offset_at(row);
+                (Ok(start), Ok(start + list.value_length() as usize))
             }
         };
         let (start, end) = match (start, end) {

@@ -145,22 +145,23 @@ pub(crate) async fn parquet_granules(
             source: None,
         });
     }
-    let Some(offset_index) = metadata
-        .offset_index()
-        .filter(|index| index.len() == metadata.row_groups().len())
-    else {
+    let Some(page_index) = metadata.page_index() else {
         return Ok((row_group_granules(&metadata, &columns), false));
     };
 
     let mut granules = Vec::new();
     let mut cursor = 0i64;
-    for (row_group, indexes) in metadata.row_groups().iter().zip(offset_index) {
+    for (row_group_idx, row_group) in metadata.row_groups().iter().enumerate() {
         let Ok(row_count) = usize::try_from(row_group.num_rows()) else {
             return Ok((row_group_granules(&metadata, &columns), false));
         };
         let Some(leaf_pages) = columns
             .iter()
-            .map(|index| indexes.get(*index).map(|index| index.page_locations()))
+            .map(|&column| {
+                page_index
+                    .offset_index(row_group_idx, column)
+                    .map(|index| index.page_locations())
+            })
             .collect::<Option<Vec<_>>>()
         else {
             return Ok((row_group_granules(&metadata, &columns), false));
@@ -2745,9 +2746,7 @@ fn build_predicate_page_selection(
     if predicates.is_empty() {
         return Ok(None);
     }
-    let (Some(column_index), Some(offset_index)) =
-        (metadata.column_index(), metadata.offset_index())
-    else {
+    let Some(page_index) = metadata.page_index().filter(|index| index.is_complete()) else {
         return Ok(None);
     };
     let row_groups = metadata.row_groups();
@@ -2787,20 +2786,16 @@ fn build_predicate_page_selection(
             // Missing page index for this column/row group: keep the whole group
             // (row-group pruning still applied).
             let (Some(col_index), Some(col_offset)) = (
-                column_index.get(rg_idx).and_then(|rg| rg.get(parquet_col)),
-                offset_index.get(rg_idx).and_then(|rg| rg.get(parquet_col)),
+                page_index.column_index(rg_idx, parquet_col),
+                page_index.offset_index(rg_idx, parquet_col),
             ) else {
                 ranges.push(base..base + rg_rows);
                 continue;
             };
             let pages = col_offset.page_locations();
-            // Fail open when the column index is absent for this chunk
-            // (`ColumnIndexMetaData::NONE` — its accessors panic rather than
-            // return `None`), when the two indexes disagree on the page count,
-            // or when the page row boundaries are malformed. Either way we
-            // cannot safely map page stats to row ranges.
+            // Keep the whole group if the indexes disagree on the page count
+            // or the page row boundaries are malformed.
             if pages.is_empty()
-                || matches!(col_index, ColumnIndexMetaData::NONE)
                 || col_index.num_pages() as usize != pages.len()
                 || !page_boundaries_valid(pages, rg_rows)
             {

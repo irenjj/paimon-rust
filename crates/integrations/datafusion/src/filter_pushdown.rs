@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::arrow::array::Array;
-use datafusion::arrow::datatypes::DataType as ArrowDataType;
-use datafusion::common::{Column, ScalarValue};
-use datafusion::logical_expr::expr::{InList, ScalarFunction};
-use datafusion::logical_expr::{
-    Between, BinaryExpr, Expr, Like, Operator, TableProviderFilterPushDown,
-};
+use arrow::array::Array;
+use arrow::datatypes::DataType as ArrowDataType;
+use datafusion_common::{Column, ScalarValue};
+use datafusion_expr::expr::{InList, ScalarFunction};
+use datafusion_expr::{Between, BinaryExpr, Expr, Like, Operator, TableProviderFilterPushDown};
 use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder};
 
 #[derive(Debug)]
@@ -329,27 +327,6 @@ impl<'a> FilterTranslator<'a> {
     }
 
     fn translate_scalar_function(&self, func: &ScalarFunction) -> Option<TranslatedPredicate> {
-        if func.func.inner().is::<crate::geospatial::BBoxIntersects>() {
-            let [column, xmin, ymin, xmax, ymax] = func.args.as_slice() else {
-                return None;
-            };
-            let field = self.resolve_field(column)?;
-            let coordinate = |expr: &Expr| match extract_scalar_literal(expr)? {
-                ScalarValue::Float64(Some(value)) => Some(*value),
-                _ => None,
-            };
-            return self.exact(
-                self.predicate_builder
-                    .bbox_intersects(
-                        field.name(),
-                        coordinate(xmin)?,
-                        coordinate(ymin)?,
-                        coordinate(xmax)?,
-                        coordinate(ymax)?,
-                    )
-                    .ok()?,
-            );
-        }
         if matches!(
             func.name(),
             "array_has"
@@ -811,13 +788,13 @@ fn scalar_to_i128(scalar: &ScalarValue) -> Option<i128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::common::Column;
-    use datafusion::logical_expr::{expr::InList, lit, TableProviderFilterPushDown};
+    use datafusion_common::Column;
+    use datafusion_expr::{expr::InList, lit, TableProviderFilterPushDown};
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
     use paimon::spec::{
         ArrayType, BigIntType, DoubleType, FloatType, IntType, LocalZonedTimestampType,
-        PredicateOperator, Schema, SmallIntType, TableSchema, TimeType, TimestampType, VarCharType,
+        PredicateOperator, Schema, TableSchema, TimeType, TimestampType, VarCharType,
     };
     use paimon::table::Table;
 
@@ -880,7 +857,7 @@ mod tests {
 
     #[test]
     fn test_float_zero_filters_fall_open_without_disabling_array_membership() {
-        use datafusion::functions_nested::expr_fn::array_has;
+        use datafusion_functions_nested::expr_fn::array_has;
 
         for (data_type, zeroes) in [
             (
@@ -967,7 +944,7 @@ mod tests {
 
     #[test]
     fn test_translate_datafusion_array_membership_functions() {
-        use datafusion::functions_nested::expr_fn::{
+        use datafusion_functions_nested::expr_fn::{
             array_has, array_has_all, array_has_any, make_array,
         };
 
@@ -1004,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_empty_array_has_all_falls_open_for_datafusion_null_semantics() {
-        use datafusion::functions_nested::expr_fn::{array_has_all, make_array};
+        use datafusion_functions_nested::expr_fn::{array_has_all, make_array};
 
         let filter = array_has_all(
             Expr::Column(Column::from_name("items")),
@@ -1021,7 +998,7 @@ mod tests {
 
     #[test]
     fn test_float_array_membership_keeps_datafusion_residual() {
-        use datafusion::functions_nested::expr_fn::array_has;
+        use datafusion_functions_nested::expr_fn::array_has;
 
         let fields = vec![DataField::new(
             1,
@@ -1044,7 +1021,7 @@ mod tests {
 
     #[test]
     fn test_negated_inexact_float_array_membership_falls_open() {
-        use datafusion::functions_nested::expr_fn::array_has;
+        use datafusion_functions_nested::expr_fn::array_has;
 
         let fields = vec![DataField::new(
             1,
@@ -1068,9 +1045,9 @@ mod tests {
 
     #[test]
     fn test_translate_analyzer_inserted_array_widening_casts() {
-        use datafusion::arrow::datatypes::DataType as ArrowDataType;
-        use datafusion::functions_nested::expr_fn::{array_has, array_has_any, make_array};
-        use datafusion::logical_expr::Cast;
+        use arrow::datatypes::DataType as ArrowDataType;
+        use datafusion_expr::Cast;
+        use datafusion_functions_nested::expr_fn::{array_has, array_has_any, make_array};
 
         let fields = test_fields();
         let widened_items = Expr::Cast(Cast::new(
@@ -1173,110 +1150,6 @@ mod tests {
             build_pushed_predicate(&[array_has(widened_floats, lit(1.1_f64))], &float_fields)
                 .is_none()
         );
-    }
-
-    #[tokio::test]
-    async fn test_translate_array_membership_after_datafusion_sql_analysis() {
-        use datafusion::arrow::datatypes::{
-            DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
-        };
-        use datafusion::datasource::empty::EmptyTable;
-        use datafusion::logical_expr::LogicalPlan;
-        use datafusion::prelude::SessionContext;
-        use std::sync::Arc;
-
-        fn filter_expr(plan: &LogicalPlan) -> Option<&Expr> {
-            match plan {
-                LogicalPlan::Filter(filter) => Some(&filter.predicate),
-                LogicalPlan::TableScan(scan) => scan.filters.first(),
-                other => other.inputs().into_iter().find_map(filter_expr),
-            }
-        }
-
-        let ctx = SessionContext::new();
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "items",
-            ArrowDataType::new_list(ArrowDataType::Int32, true),
-            true,
-        )]));
-        ctx.register_table("t", Arc::new(EmptyTable::new(arrow_schema)))
-            .unwrap();
-        let fields = vec![DataField::new(
-            1,
-            "items".to_string(),
-            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
-        )];
-        let cases = [
-            (
-                "SELECT * FROM t WHERE array_has(items, 2)",
-                PredicateOperator::ArrayContains,
-                vec![Datum::Int(2)],
-            ),
-            (
-                "SELECT * FROM t WHERE array_has_any(items, [1, 3])",
-                PredicateOperator::ArraysOverlap,
-                vec![Datum::Int(1), Datum::Int(3)],
-            ),
-            (
-                "SELECT * FROM t WHERE array_has_all(items, [1, 3])",
-                PredicateOperator::ArrayContainsAll,
-                vec![Datum::Int(1), Datum::Int(3)],
-            ),
-        ];
-        for (sql, expected_op, expected_literals) in cases {
-            let plan = ctx.state().create_logical_plan(sql).await.unwrap();
-            let plan = ctx.state().optimize(&plan).unwrap();
-            let filter = filter_expr(&plan).expect("optimized plan should retain the filter");
-            assert!(filter.to_string().contains("CAST"));
-
-            let predicate = build_pushed_predicate(std::slice::from_ref(filter), &fields)
-                .expect("analyzed SQL array predicate should translate");
-            assert!(matches!(
-                predicate,
-                Predicate::Leaf { op, literals, .. }
-                    if op == expected_op && literals == expected_literals
-            ));
-        }
-
-        let numeric_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new(
-                "small_items",
-                ArrowDataType::new_list(ArrowDataType::Int16, true),
-                true,
-            ),
-            ArrowField::new(
-                "float_items",
-                ArrowDataType::new_list(ArrowDataType::Float32, true),
-                true,
-            ),
-        ]));
-        ctx.register_table("numeric_arrays", Arc::new(EmptyTable::new(numeric_schema)))
-            .unwrap();
-        let numeric_fields = vec![
-            DataField::new(
-                1,
-                "small_items".to_string(),
-                DataType::Array(ArrayType::new(DataType::SmallInt(SmallIntType::new()))),
-            ),
-            DataField::new(
-                2,
-                "float_items".to_string(),
-                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
-            ),
-        ];
-        for sql in [
-            "SELECT * FROM numeric_arrays WHERE array_has(small_items, 2)",
-            "SELECT * FROM numeric_arrays WHERE array_has(float_items, 1.0)",
-        ] {
-            let plan = ctx.state().create_logical_plan(sql).await.unwrap();
-            let plan = ctx.state().optimize(&plan).unwrap();
-            let filter = filter_expr(&plan).expect("optimized plan should retain the filter");
-            assert!(filter.to_string().contains("CAST"));
-            assert!(
-                build_pushed_predicate(std::slice::from_ref(filter), &numeric_fields).is_some(),
-                "analyzed numeric ARRAY predicate should translate: {filter}"
-            );
-        }
     }
 
     #[test]
@@ -1693,7 +1566,7 @@ mod tests {
     #[test]
     fn test_translate_starts_with_udf() {
         let fields = test_fields();
-        let filter = datafusion::functions::string::expr_fn::starts_with(
+        let filter = datafusion_functions::string::expr_fn::starts_with(
             Expr::Column(Column::from_name("dt")),
             lit("2024"),
         );
@@ -1711,7 +1584,7 @@ mod tests {
     #[test]
     fn test_translate_ends_with_udf() {
         let fields = test_fields();
-        let filter = datafusion::functions::string::expr_fn::ends_with(
+        let filter = datafusion_functions::string::expr_fn::ends_with(
             Expr::Column(Column::from_name("dt")),
             lit("01-01"),
         );
@@ -1728,7 +1601,7 @@ mod tests {
     #[test]
     fn test_translate_contains_udf() {
         let fields = test_fields();
-        let filter = datafusion::functions::string::expr_fn::contains(
+        let filter = datafusion_functions::string::expr_fn::contains(
             Expr::Column(Column::from_name("dt")),
             lit("01"),
         );
@@ -1746,7 +1619,7 @@ mod tests {
     fn test_translate_starts_with_on_non_string_column_falls_open() {
         let fields = test_fields();
         // `id` is Int — datum coercion fails and translation returns None.
-        let filter = datafusion::functions::string::expr_fn::starts_with(
+        let filter = datafusion_functions::string::expr_fn::starts_with(
             Expr::Column(Column::from_name("id")),
             lit("foo"),
         );

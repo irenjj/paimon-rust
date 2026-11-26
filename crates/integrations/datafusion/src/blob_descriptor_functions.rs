@@ -17,19 +17,18 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
+use arrow::array::{
     Array, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeBinaryBuilder, LargeStringArray,
     StringArray, StringBuilder, StringViewArray,
 };
-use datafusion::arrow::datatypes::DataType as ArrowDataType;
-use datafusion::common::types::logical_binary;
-use datafusion::common::utils::take_function_args;
-use datafusion::common::{DataFusionError, Result as DFResult, ScalarValue};
-use datafusion::logical_expr::{
+use arrow::datatypes::DataType as ArrowDataType;
+use datafusion_common::types::logical_binary;
+use datafusion_common::utils::take_function_args;
+use datafusion_common::{DataFusionError, Result as DFResult, ScalarValue};
+use datafusion_expr::{
     Coercion, ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
     TypeSignatureClass, Volatility,
 };
-use datafusion::prelude::SessionContext;
 use paimon::spec::BlobDescriptor;
 
 use crate::error::to_datafusion_error;
@@ -37,9 +36,12 @@ use crate::error::to_datafusion_error;
 const PATH_TO_DESCRIPTOR: &str = "path_to_descriptor";
 const DESCRIPTOR_TO_STRING: &str = "descriptor_to_string";
 
-pub(crate) fn register_blob_descriptor_functions(ctx: &SessionContext) {
-    ctx.register_udf(ScalarUDF::from(PathToDescriptorFunc::new()));
-    ctx.register_udf(ScalarUDF::from(DescriptorToStringFunc::new()));
+/// Creates `path_to_descriptor` and `descriptor_to_string` for host registration.
+pub fn blob_descriptor_functions() -> [ScalarUDF; 2] {
+    [
+        ScalarUDF::from(PathToDescriptorFunc::new()),
+        ScalarUDF::from(DescriptorToStringFunc::new()),
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

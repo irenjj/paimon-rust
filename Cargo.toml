@@ -19,12 +19,7 @@
 resolver = "2"
 members = [
     "crates/paimon",
-    "crates/paimon-rest-server",
-    "crates/integration_tests",
-    "bindings/c",
-    "bindings/python",
     "crates/integrations/datafusion",
-    "benchmarks/tpcds",
 ]
 
 [workspace.package]
@@ -36,21 +31,32 @@ license = "Apache-2.0"
 rust-version = "1.95.0"
 
 [workspace.dependencies]
-arrow = "59.2"
-arrow-array = { version = "59.2", features = ["ffi"] }
-arrow-arith = "59.2"
-arrow-buffer = "59.2"
-arrow-schema = "59.2"
-arrow-cast = "59.2"
-arrow-ord = "59.2"
-arrow-row = "59.2"
-arrow-select = "59.2"
-arrow-string = "59.2"
-datafusion = "55.2.0"
-datafusion-ffi = "55.2.0"
-datafusion-spark = { version = "55.2.0", features = ["core"] }
-paimon = { version = "0.6.0", path = "crates/paimon" }
-parquet = "59.3.3"
-constant_time_eq = ">=0.4.0, <0.5.0"
+arrow = "60.2.0"
+arrow-array = { version = "60.2.0", features = ["ffi"] }
+arrow-arith = "60.2.0"
+arrow-buffer = "60.2.0"
+arrow-schema = "60.2.0"
+arrow-cast = "60.2.0"
+arrow-ipc = "60.2.0"
+arrow-json = "60.2.0"
+arrow-ord = "60.2.0"
+arrow-row = "60.2.0"
+arrow-select = "60.2.0"
+arrow-string = "60.2.0"
+datafusion-common = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/common" }
+datafusion-expr = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/expr" }
+datafusion-session = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/session" }
+datafusion-catalog = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/catalog" }
+datafusion-datasource = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/datasource" }
+datafusion-datasource-parquet = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/datasource-parquet" }
+datafusion-execution = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/execution" }
+datafusion-physical-plan = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/physical-plan" }
+datafusion-physical-expr = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/physical-expr" }
+datafusion-physical-expr-adapter = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/physical-expr-adapter" }
+datafusion-functions-nested = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/functions-nested" }
+datafusion-physical-expr-common = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/physical-expr-common" }
+datafusion-functions = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/functions" }
+paimon = { version = "0.6.0", path = "crates/paimon", default-features = false }
+parquet = "60.2.0"
 tokio = "1.39.2"
 tokio-util = "0.7"

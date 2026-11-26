@@ -75,7 +75,7 @@ impl BlobReaderRegistry {
 
     fn register_location(readers: &RwLock<Vec<BlobFileIO>>, prefix: &str, file_io: FileIO) {
         let mut prefixes = vec![prefix.to_string()];
-        if let Ok(url) = datafusion::datasource::listing::ListingTableUrl::parse(prefix) {
+        if let Ok(url) = datafusion_datasource::ListingTableUrl::parse(prefix) {
             let url: &url::Url = url.as_ref();
             if let Ok(path) = url
                 .to_file_path()
@@ -104,7 +104,7 @@ impl BlobReaderRegistry {
     }
 
     /// Compare equivalent URI/path spellings before choosing the closest route.
-    pub(crate) fn resolve_paths(&self, paths: &[String]) -> Option<FileIO> {
+    pub fn resolve_paths(&self, paths: &[String]) -> Option<FileIO> {
         let readers = self.readers.read().unwrap_or_else(|e| e.into_inner());
         let catalogs = self
             .catalog_readers

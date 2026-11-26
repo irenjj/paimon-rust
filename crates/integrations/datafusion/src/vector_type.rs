@@ -19,86 +19,37 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::{Field, FieldRef};
-use datafusion::common::{plan_datafusion_err, Result};
-use datafusion::logical_expr::planner::TypePlanner;
-use datafusion::sql::sqlparser::ast::{ArrayElemTypeDef, DataType, Expr, Statement};
-use datafusion::sql::sqlparser::dialect::GenericDialect;
-use datafusion::sql::sqlparser::keywords::Keyword;
-use datafusion::sql::sqlparser::parser::{Parser, ParserError};
-use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithSpan};
+use arrow::datatypes::{Field, FieldRef};
+use datafusion_common::{plan_datafusion_err, Result};
+use datafusion_expr::planner::TypePlanner;
 use paimon::spec::{DataType as PaimonDataType, VectorType};
+use sqlparser::ast::{DataType, Expr, Statement};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::keywords::Keyword;
+use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::{Token, TokenWithSpan};
 
 use crate::error::to_datafusion_error;
 
 #[derive(Debug)]
-pub(crate) struct PaimonTypePlanner;
+/// Plans Paimon VECTOR types in DataFusion expressions.
+#[derive(Default)]
+pub struct PaimonTypePlanner;
 
 impl TypePlanner for PaimonTypePlanner {
     fn plan_type_field(&self, sql_type: &DataType) -> Result<Option<FieldRef>> {
-        let paimon_type = if let Some(vector) = sql_type_to_vector(sql_type, true)? {
-            Some(PaimonDataType::Vector(vector))
-        } else if matches!(sql_type, DataType::Map(_, _)) && contains_vector(sql_type) {
-            if contains_sql_type(sql_type, |ty| {
-                matches!(
-                    ty,
-                    DataType::Array(ArrayElemTypeDef::SquareBracket(_, Some(_)))
-                )
-            }) {
-                return Err(datafusion::error::DataFusionError::NotImplemented(
-                    "Fixed-size SQL arrays inside vector MAP types are not supported; use ARRAY<T> for variable-length collections".to_string(),
-                ));
-            }
-            // DataFusion 55.2 cannot plan MAP itself, including a MAP reached
-            // recursively from ARRAY/STRUCT. Use Paimon's mapping for vector maps.
-            Some(crate::sql_context::sql_data_type_to_paimon_type(
-                sql_type, true,
-            )?)
-        } else {
-            None
-        };
-        if let Some(paimon_type) = paimon_type {
-            let arrow_type =
-                paimon::arrow::paimon_type_to_arrow(&paimon_type).map_err(to_datafusion_error)?;
-            return Ok(Some(Arc::new(Field::new(
-                "",
-                arrow_type,
-                paimon_type.is_nullable(),
-            ))));
-        }
-        crate::binary_cast::BinaryTypePlanner.plan_type_field(sql_type)
-    }
-}
-
-fn contains_vector(sql_type: &DataType) -> bool {
-    contains_sql_type(sql_type, |ty| match ty {
-        DataType::Custom(name, _) => name
-            .0
-            .first()
-            .and_then(|part| part.as_ident())
-            .and_then(|ident| ident.value.get(..7))
-            .is_some_and(|prefix| name.0.len() == 1 && prefix.eq_ignore_ascii_case("VECTOR<")),
-        _ => false,
-    })
-}
-
-fn contains_sql_type(sql_type: &DataType, predicate: fn(&DataType) -> bool) -> bool {
-    if predicate(sql_type) {
-        return true;
-    }
-    match sql_type {
-        DataType::Array(
-            ArrayElemTypeDef::AngleBracket(element)
-            | ArrayElemTypeDef::SquareBracket(element, _)
-            | ArrayElemTypeDef::Parenthesis(element),
-        ) => contains_sql_type(element, predicate),
-        DataType::Map(key, value) => {
-            contains_sql_type(key, predicate) || contains_sql_type(value, predicate)
-        }
-        DataType::Struct(fields, _) => fields
-            .iter()
-            .any(|field| contains_sql_type(&field.field_type, predicate)),
-        _ => false,
+        sql_type_to_vector(sql_type, true)?
+            .map(|vector| {
+                let paimon_type = PaimonDataType::Vector(vector);
+                let arrow_type = paimon::arrow::paimon_type_to_arrow(&paimon_type)
+                    .map_err(to_datafusion_error)?;
+                Ok(Arc::new(Field::new(
+                    "",
+                    arrow_type,
+                    paimon_type.is_nullable(),
+                )))
+            })
+            .transpose()
     }
 }
 
@@ -108,14 +59,15 @@ fn contains_sql_type(sql_type: &DataType, predicate: fn(&DataType) -> bool) -> b
 /// DataFusion reparsing without losing the element type or its nullability.
 /// Waiting for the parser to reject '<' leaves comparisons involving a column
 /// named vector untouched, even in statements that also contain VECTOR types.
-pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, ParserError> {
+pub fn parse_sql(sql: &str) -> Result<Vec<Statement>, ParserError> {
     let tokens = Parser::new(&GenericDialect {})
         .try_with_sql(sql)?
         .into_tokens();
     parse_statements(tokens).map(|(statements, _)| statements)
 }
 
-pub(crate) fn parse_expr(sql: &str) -> Result<Expr, ParserError> {
+/// Parses an expression with optional Paimon VECTOR type syntax.
+pub fn parse_expr(sql: &str) -> Result<Expr, ParserError> {
     let mut tokens = Parser::new(&GenericDialect {})
         .try_with_sql(sql)?
         .into_tokens();
@@ -370,7 +322,33 @@ pub(crate) fn sql_type_to_vector(
             VectorType::MAX_LENGTH
         )
     })?;
-    let element = crate::sql_context::sql_data_type_to_paimon_type(&element, element_nullable)?;
+    use paimon::spec::{
+        BigIntType, BooleanType, DoubleType, FloatType, IntType, SmallIntType, TinyIntType,
+    };
+    let element = match element {
+        DataType::Boolean => PaimonDataType::Boolean(BooleanType::with_nullable(element_nullable)),
+        DataType::TinyInt(_) => {
+            PaimonDataType::TinyInt(TinyIntType::with_nullable(element_nullable))
+        }
+        DataType::SmallInt(_) => {
+            PaimonDataType::SmallInt(SmallIntType::with_nullable(element_nullable))
+        }
+        DataType::Int(_) | DataType::Integer(_) => {
+            PaimonDataType::Int(IntType::with_nullable(element_nullable))
+        }
+        DataType::BigInt(_) => PaimonDataType::BigInt(BigIntType::with_nullable(element_nullable)),
+        DataType::Float(_) | DataType::Real => {
+            PaimonDataType::Float(FloatType::with_nullable(element_nullable))
+        }
+        DataType::Double(_) | DataType::DoublePrecision => {
+            PaimonDataType::Double(DoubleType::with_nullable(element_nullable))
+        }
+        other => {
+            return Err(plan_datafusion_err!(
+                "Invalid element type for VECTOR: {other}"
+            ))
+        }
+    };
     VectorType::try_new(nullable && !vector_not_null, length, element)
         .map(Some)
         .map_err(to_datafusion_error)
@@ -412,8 +390,8 @@ mod tests {
         let Statement::AlterTable(table) = &statements[0] else {
             panic!("expected ALTER TABLE");
         };
-        let datafusion::sql::sqlparser::ast::AlterTableOperation::AlterColumn {
-            op: datafusion::sql::sqlparser::ast::AlterColumnOperation::SetDataType { data_type, .. },
+        let sqlparser::ast::AlterTableOperation::AlterColumn {
+            op: sqlparser::ast::AlterColumnOperation::SetDataType { data_type, .. },
             ..
         } = &table.operations[0]
         else {

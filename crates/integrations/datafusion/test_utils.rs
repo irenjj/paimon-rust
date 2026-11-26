@@ -19,8 +19,8 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow_array::{Array, Int32Array, RecordBatch};
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow::array::{Array, Int32Array, RecordBatch};
+use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use chrono::Utc;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;

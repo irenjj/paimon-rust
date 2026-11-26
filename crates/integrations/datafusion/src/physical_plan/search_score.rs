@@ -19,19 +19,19 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
+use arrow::array::{
     Array, ArrayRef, Float32Array, Int64Array, RecordBatch, RecordBatchOptions, UInt32Array,
 };
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::common::stats::Precision;
-use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{internal_err, DataFusionError, Statistics};
-use datafusion::error::Result as DFResult;
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
+use arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::Result as DFResult;
+use datafusion_common::{internal_err, DataFusionError, Statistics};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
     Partitioning, PlanProperties, ReplaceChildrenOptions, StatisticsArgs,
 };
@@ -220,9 +220,9 @@ impl ExecutionPlan for SearchScoreExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::Int32Array;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::physical_plan::empty::EmptyExec;
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_physical_plan::empty::EmptyExec;
 
     #[test]
     fn test_filter_and_project_by_row_id_filters_non_matches_and_reorders_columns() {

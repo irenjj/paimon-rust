@@ -15,541 +15,61 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Paimon catalog integration for DataFusion.
-
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use async_trait::async_trait;
-use datafusion::catalog::{CatalogProvider, MemorySchemaProvider, SchemaProvider};
-use datafusion::common::{plan_datafusion_err, Column};
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
-use datafusion::execution::SessionState;
-use datafusion::logical_expr::{expr_fn::cast, Expr, LogicalPlan, LogicalPlanBuilder};
-use datafusion::prelude::SessionContext;
-use datafusion::sql::planner::IdentNormalizer;
-use datafusion::sql::sqlparser::ast::{Ident, ObjectName, Statement};
-use datafusion::sql::sqlparser::dialect::GenericDialect;
-use datafusion::sql::sqlparser::parser::Parser;
-use paimon::catalog::{Catalog, Identifier, View};
-use paimon::spec::TableType as PaimonTableType;
+use datafusion_catalog::{CatalogProvider, SchemaProvider, TableProvider};
+use datafusion_common::Result as DFResult;
+use paimon::catalog::{Catalog, Identifier};
 
 use crate::error::to_datafusion_error;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
-use crate::system_tables;
-use crate::table::{ObjectTableProvider, PaimonTableProvider};
+use crate::table::{build_table_definition, PaimonTableProvider};
+use crate::table_loader::loaded_table_for_read;
 use crate::{BlobReaderRegistry, DynamicOptions};
 
-pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Send + Sync>;
-
-/// Engine registry shared between the catalog provider and its schema
-/// providers, so registrations stay visible to schemas obtained earlier.
-type TableEngines = Arc<RwLock<HashMap<PaimonTableType, Arc<dyn TableEngineResolver>>>>;
-
-/// Identifies an engine-owned table.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct EngineTableRequest {
-    pub database: String,
-    pub table: String,
-    /// The type the table's metadata declares.
-    pub declared: PaimonTableType,
-}
-
-impl EngineTableRequest {
-    pub fn new(database: String, table: String, declared: PaimonTableType) -> Self {
-        Self {
-            database,
-            table,
-            declared,
-        }
-    }
-}
-
-/// Resolves external tables. `Ok(None)` means missing; engine errors propagate.
-#[async_trait]
-pub trait TableEngineResolver: Debug + Send + Sync {
-    /// Resolve a request to the engine's table provider.
-    async fn resolve_table(
-        &self,
-        request: &EngineTableRequest,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>>;
-
-    /// Resolve an exact snapshot and its schema.
-    /// Missing snapshots are errors; `Ok(None)` means the table is missing.
-    async fn resolve_table_snapshot(
-        &self,
-        request: &EngineTableRequest,
-        _snapshot_id: i64,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        Err(plan_datafusion_err!(
-            "time travel is not supported for routed '{}' tables ('{}.{}')",
-            request.declared,
-            request.database,
-            request.table
-        ))
-    }
-
-    /// Resolve the table as of `timestamp_millis` (epoch milliseconds) and its
-    /// schema; the engine picks the snapshot. A time with no snapshot is an error;
-    /// `Ok(None)` means the table is missing.
-    async fn resolve_table_at_timestamp(
-        &self,
-        request: &EngineTableRequest,
-        _timestamp_millis: i64,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        Err(plan_datafusion_err!(
-            "timestamp time travel is not supported for routed '{}' tables ('{}.{}')",
-            request.declared,
-            request.database,
-            request.table
-        ))
-    }
-
-    /// Resolves `<table>$<metadata_table>`; returns `Ok(None)` if missing or unsupported.
-    /// The request names the base table; `metadata_table` is ASCII-lowercase.
-    /// Session scan options are checked before this call.
-    async fn resolve_metadata_table(
-        &self,
-        _request: &EngineTableRequest,
-        _metadata_table: &str,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        Ok(None)
-    }
-}
-
-/// Delegates reads to the engine and rejects DML.
-#[derive(Debug, Clone)]
-pub(crate) struct ReadOnlyTableProvider {
-    inner: Arc<dyn TableProvider>,
-    pub(crate) declared: PaimonTableType,
-    pub(crate) table_name: String,
-    metadata_table: bool,
-    request: EngineTableRequest,
-    resolver: Arc<dyn TableEngineResolver>,
-    dynamic_options: DynamicOptions,
-}
-
-/// The historical state requested from an engine.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum EngineTimeTravel {
-    Snapshot(i64),
-    TimestampMillis(i64),
-}
-
-impl std::fmt::Display for EngineTimeTravel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Snapshot(id) => write!(f, "snapshot {id}"),
-            Self::TimestampMillis(millis) => write!(f, "timestamp-millis {millis}"),
-        }
-    }
-}
-
-pub(crate) fn unsupported_engine_time_travel(
-    declared: PaimonTableType,
-    table_name: &str,
-) -> datafusion::error::DataFusionError {
-    plan_datafusion_err!(
-        "time travel is not supported for routed '{declared}' tables ('{table_name}'); \
-         only VERSION AS OF with an integer snapshot id and TIMESTAMP AS OF \
-         are supported on data tables"
-    )
-}
-
-impl ReadOnlyTableProvider {
-    pub(crate) fn unsupported_time_travel(&self) -> datafusion::error::DataFusionError {
-        unsupported_engine_time_travel(self.declared, &self.table_name)
-    }
-
-    pub(crate) async fn at_time_travel(
-        &self,
-        travel: EngineTimeTravel,
-    ) -> DFResult<Arc<dyn TableProvider>> {
-        if self.metadata_table {
-            return Err(self.unsupported_time_travel());
-        }
-        resolve_engine_time_travel(
-            self.request.clone(),
-            Arc::clone(&self.resolver),
-            Arc::clone(&self.dynamic_options),
-            travel,
-        )
-        .await
-    }
-}
-
-pub(crate) fn parse_engine_snapshot_id(version: &str) -> DFResult<i64> {
-    version.parse().map_err(|_| {
-        plan_datafusion_err!(
-            "external table time travel requires an integer snapshot id in VERSION AS OF, got '{version}'"
-        )
-    })
-}
-
-async fn resolve_engine_time_travel(
-    request: EngineTableRequest,
-    resolver: Arc<dyn TableEngineResolver>,
-    dynamic_options: DynamicOptions,
-    travel: EngineTimeTravel,
-) -> DFResult<Arc<dyn TableProvider>> {
-    await_with_runtime(async move {
-        let table_name = format!("{}.{}", request.database, request.table);
-        let options = dynamic_options
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        paimon::spec::CoreOptions::new(&options)
-            .ensure_engine_can_serve(&table_name)
-            .map_err(to_datafusion_error)?;
-        let resolved = match travel {
-            EngineTimeTravel::Snapshot(id) => resolver.resolve_table_snapshot(&request, id).await?,
-            EngineTimeTravel::TimestampMillis(millis) => {
-                resolver
-                    .resolve_table_at_timestamp(&request, millis)
-                    .await?
-            }
-        };
-        let inner = resolved.ok_or_else(|| {
-            plan_datafusion_err!("table '{table_name}' was not found at {travel}")
-        })?;
-        Ok(Arc::new(ReadOnlyTableProvider {
-            inner,
-            declared: request.declared,
-            table_name,
-            metadata_table: false,
-            request,
-            resolver,
-            dynamic_options,
-        }) as Arc<dyn TableProvider>)
-    })
-    .await
-}
-
-#[async_trait]
-impl TableProvider for ReadOnlyTableProvider {
-    fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
-        self.inner.schema()
-    }
-
-    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
-        self.inner.constraints()
-    }
-
-    fn table_type(&self) -> TableType {
-        if self.metadata_table {
-            TableType::View
-        } else {
-            self.inner.table_type()
-        }
-    }
-
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
-
-    fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn datafusion::catalog::Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        self.inner.scan(state, projection, filters, limit).await
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DFResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    fn statistics(&self) -> Option<datafusion::common::Statistics> {
-        self.inner.statistics()
-    }
-
-    async fn insert_into(
-        &self,
-        _state: &dyn datafusion::catalog::Session,
-        _input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
-        _insert_op: datafusion::logical_expr::dml::InsertOp,
-    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        Err(plan_datafusion_err!(
-            "write is not supported for routed '{}' tables ('{}')",
-            self.declared,
-            self.table_name
-        ))
-    }
-}
-
-/// Exposes an unregistered engine's table schema while rejecting scans and writes.
-#[derive(Debug)]
-pub(crate) struct UnavailableEngineTableProvider {
-    schema: datafusion::arrow::datatypes::SchemaRef,
-    declared: PaimonTableType,
-    table_name: String,
-}
-
-impl UnavailableEngineTableProvider {
-    pub(crate) fn unavailable_error(&self) -> datafusion::error::DataFusionError {
-        plan_datafusion_err!(
-            "no table engine is registered for '{}' tables ('{}')",
-            self.declared,
-            self.table_name
-        )
-    }
-}
-
-#[async_trait]
-impl TableProvider for UnavailableEngineTableProvider {
-    fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn datafusion::catalog::Session,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        Err(self.unavailable_error())
-    }
-
-    async fn insert_into(
-        &self,
-        _state: &dyn datafusion::catalog::Session,
-        _input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
-        _insert_op: datafusion::logical_expr::dml::InsertOp,
-    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        Err(self.unavailable_error())
-    }
-}
-
-/// Register `resolver` as the engine for `table_type` on the Paimon catalog
-/// named `catalog_name`.
-///
-/// Also installs [`PaimonRelationPlanner`](crate::PaimonRelationPlanner), so
-/// version clauses cannot slip past this crate (see [`PaimonCatalogProvider`]).
-/// [`SQLContext::register_catalog_table_engine`](crate::SQLContext::register_catalog_table_engine)
-/// is equivalent.
-pub fn register_catalog_table_engine(
-    ctx: &SessionContext,
-    catalog_name: &str,
-    table_type: PaimonTableType,
-    resolver: Arc<dyn TableEngineResolver>,
-) -> DFResult<()> {
-    ctx.register_relation_planner(Arc::new(crate::PaimonRelationPlanner::new()))?;
-    let provider = ctx
-        .catalog(catalog_name)
-        .ok_or_else(|| plan_datafusion_err!("Unknown catalog '{catalog_name}'"))?;
-    provider
-        .downcast_ref::<PaimonCatalogProvider>()
-        .ok_or_else(|| plan_datafusion_err!("Catalog '{catalog_name}' is not a Paimon catalog"))?
-        .register_table_engine(table_type, resolver)
-}
-
-/// Provides an interface to manage and access multiple schemas (databases)
-/// within a Paimon [`Catalog`].
-///
-/// This provider uses lazy loading - databases and tables are fetched
-/// on-demand from the catalog, ensuring data is always fresh.
-///
-/// # Table-version clauses
-///
-/// SQL queries using `VERSION`/`TIMESTAMP AS OF` need
-/// [`PaimonRelationPlanner`](crate::PaimonRelationPlanner) installed on the
-/// session; DataFusion's default planner drops the clause before this crate
-/// sees it, so the query would read current data. [`SQLContext`](crate::SQLContext)
-/// installs it, as does
-/// [`register_catalog_table_engine`]. A plain `SessionContext` querying Paimon
-/// tables directly must install it with
-/// `ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))`.
+/// Exposes native Paimon tables through a read-only DataFusion catalog.
 pub struct PaimonCatalogProvider {
-    catalog_name: Option<String>,
-    /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
-    /// Session-scoped dynamic options shared with the SQL context.
     dynamic_options: DynamicOptions,
-    /// Temporary in-memory tables and views stored in MemorySchemaProvider per database.
-    ///
-    /// Uses `RwLock` with poison recovery (`unwrap_or_else(|e| e.into_inner())`) throughout.
-    /// This is a deliberate choice: since temp tables are session-scoped and non-critical,
-    /// it is preferable to continue with potentially stale data after a panic rather than
-    /// propagate the panic to all subsequent operations. The worst case is a temp table
-    /// becoming invisible or stale, which is recoverable by re-registering it.
-    temp_tables: Arc<RwLock<HashMap<String, Arc<MemorySchemaProvider>>>>,
     blob_reader_registry: BlobReaderRegistry,
-    session_state: Option<SessionStateProvider>,
     schema_force_view_types: bool,
-    /// Engines for table types served elsewhere, keyed by declared
-    /// [`PaimonTableType`]. Same poison-recovery stance as `temp_tables`.
-    table_engines: TableEngines,
 }
 
 impl Debug for PaimonCatalogProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PaimonCatalogProvider").finish()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaimonCatalogProvider")
+            .finish_non_exhaustive()
     }
 }
 
 impl PaimonCatalogProvider {
-    /// Creates a new [`PaimonCatalogProvider`].
+    /// Creates a provider with shared read options and a descriptor reader registry.
     pub fn new(
-        catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
         dynamic_options: DynamicOptions,
         blob_reader_registry: BlobReaderRegistry,
-        session_state: Option<SessionStateProvider>,
     ) -> Self {
-        PaimonCatalogProvider {
-            catalog_name,
+        if let Some(filesystem) = catalog
+            .as_any()
+            .and_then(|catalog| catalog.downcast_ref::<paimon::FileSystemCatalog>())
+        {
+            blob_reader_registry
+                .register_catalog_location(filesystem.warehouse(), filesystem.file_io().clone());
+        }
+        Self {
             catalog,
             dynamic_options,
-            temp_tables: Arc::new(RwLock::new(HashMap::new())),
             blob_reader_registry,
-            session_state,
             schema_force_view_types: true,
-            table_engines: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Configure whether table schemas use Arrow view types when available.
-    ///
-    /// Disable this for consumers that cannot operate on Arrow view arrays. This changes the
-    /// schema exposed to DataFusion, so query operators above the table scan will use the classic
-    /// Arrow types as well.
-    pub fn with_schema_force_view_types(mut self, schema_force_view_types: bool) -> Self {
-        self.schema_force_view_types = schema_force_view_types;
+    /// Selects whether scan schemas use Arrow view types where supported.
+    pub fn with_schema_force_view_types(mut self, enabled: bool) -> Self {
+        self.schema_force_view_types = enabled;
         self
-    }
-
-    /// Register an engine for a table type the Paimon reader cannot serve
-    /// (e.g. [`PaimonTableType::IcebergTable`]); everything else takes the
-    /// Paimon path unchanged. Kept inside the provider so the registered
-    /// catalog type never changes and downcast-based paths (temp tables,
-    /// time travel) keep working.
-    pub(crate) fn register_table_engine(
-        &self,
-        table_type: PaimonTableType,
-        resolver: Arc<dyn TableEngineResolver>,
-    ) -> DFResult<()> {
-        // Routing a Paimon-served type would split it between engines:
-        // reads via the resolver, raw get_table paths via Paimon.
-        if !table_type.requires_table_engine() {
-            return Err(plan_datafusion_err!(
-                "table type '{table_type}' is served by the Paimon reader and cannot be \
-                 routed to a table engine"
-            ));
-        }
-        self.table_engines
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(table_type, resolver);
-        Ok(())
-    }
-
-    fn table_engines(&self) -> TableEngines {
-        Arc::clone(&self.table_engines)
-    }
-
-    pub(crate) async fn table_at_time_travel(
-        &self,
-        request: EngineTableRequest,
-        travel: EngineTimeTravel,
-    ) -> DFResult<Arc<dyn TableProvider>> {
-        let resolver = self
-            .table_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&request.declared)
-            .cloned()
-            .ok_or_else(|| {
-                plan_datafusion_err!(
-                    "no table engine is registered for '{}' tables ('{}.{}')",
-                    request.declared,
-                    request.database,
-                    request.table
-                )
-            })?;
-        resolve_engine_time_travel(request, resolver, Arc::clone(&self.dynamic_options), travel)
-            .await
-    }
-
-    fn paimon_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        let catalog = Arc::clone(&self.catalog);
-        let table_engines = self.table_engines();
-        let dynamic_options = Arc::clone(&self.dynamic_options);
-        let blob_reader_registry = self.blob_reader_registry.clone();
-        let catalog_name = self.catalog_name.clone();
-        let session_state = self.session_state.clone();
-        let schema_force_view_types = self.schema_force_view_types;
-        let name = name.to_string();
-
-        let temp_provider = {
-            let databases = self.temp_tables.read().unwrap_or_else(|e| e.into_inner());
-            databases.get(&name).cloned()
-        };
-
-        block_on_with_runtime(
-            async move {
-                match catalog.get_database(&name).await {
-                    Ok(_) => Some(Arc::new(
-                        PaimonSchemaProvider::new(
-                            catalog_name,
-                            Arc::clone(&catalog),
-                            name,
-                            dynamic_options,
-                            temp_provider,
-                            blob_reader_registry,
-                            session_state,
-                        )
-                        .with_schema_force_view_types(schema_force_view_types)
-                        .with_table_engines(Arc::clone(&table_engines)),
-                    ) as Arc<dyn SchemaProvider>),
-                    Err(paimon::Error::DatabaseNotExist { .. }) => {
-                        if temp_provider.is_some() {
-                            Some(Arc::new(
-                                PaimonSchemaProvider::new(
-                                    catalog_name,
-                                    Arc::clone(&catalog),
-                                    name,
-                                    dynamic_options,
-                                    temp_provider,
-                                    blob_reader_registry,
-                                    session_state,
-                                )
-                                .with_schema_force_view_types(schema_force_view_types)
-                                .with_table_engines(Arc::clone(&table_engines)),
-                            ) as Arc<dyn SchemaProvider>)
-                        } else {
-                            None
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("failed to get database '{}': {e}", name);
-                        None
-                    }
-                }
-            },
-            "paimon catalog access thread panicked",
-        )
     }
 }
 
@@ -558,8 +78,8 @@ impl CatalogProvider for PaimonCatalogProvider {
         let catalog = Arc::clone(&self.catalog);
         block_on_with_runtime(
             async move {
-                catalog.list_databases().await.unwrap_or_else(|e| {
-                    log::error!("failed to list databases: {e}");
+                catalog.list_databases().await.unwrap_or_else(|error| {
+                    log::error!("failed to list Paimon databases: {error}");
                     vec![]
                 })
             },
@@ -568,560 +88,45 @@ impl CatalogProvider for PaimonCatalogProvider {
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.paimon_schema(name)
-    }
-
-    fn register_schema(
-        &self,
-        name: &str,
-        _schema: Arc<dyn SchemaProvider>,
-    ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
         let catalog = Arc::clone(&self.catalog);
-        let dynamic_options = Arc::clone(&self.dynamic_options);
-        let blob_reader_registry = self.blob_reader_registry.clone();
-        let catalog_name = self.catalog_name.clone();
-        let session_state = self.session_state.clone();
-        let schema_force_view_types = self.schema_force_view_types;
-        let name = name.to_string();
-        block_on_with_runtime(
-            async move {
-                catalog
-                    .create_database(&name, false, HashMap::new())
-                    .await
-                    .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(
-                    PaimonSchemaProvider::new(
-                        catalog_name,
-                        Arc::clone(&catalog),
-                        name,
-                        dynamic_options,
-                        None,
-                        blob_reader_registry,
-                        session_state,
-                    )
-                    .with_schema_force_view_types(schema_force_view_types),
-                ) as Arc<dyn SchemaProvider>))
-            },
+        let name = name.to_owned();
+        let database = name.clone();
+        let exists = block_on_with_runtime(
+            async move { catalog.get_database(&database).await },
             "paimon catalog access thread panicked",
-        )
-    }
-
-    fn deregister_schema(
-        &self,
-        name: &str,
-        cascade: bool,
-    ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
-        let catalog = Arc::clone(&self.catalog);
-        let dynamic_options = Arc::clone(&self.dynamic_options);
-        let blob_reader_registry = self.blob_reader_registry.clone();
-        let catalog_name = self.catalog_name.clone();
-        let session_state = self.session_state.clone();
-        let schema_force_view_types = self.schema_force_view_types;
-        let name = name.to_string();
-        block_on_with_runtime(
-            async move {
-                catalog
-                    .drop_database(&name, false, cascade)
-                    .await
-                    .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(
-                    PaimonSchemaProvider::new(
-                        catalog_name,
-                        Arc::clone(&catalog),
-                        name,
-                        dynamic_options,
-                        None,
-                        blob_reader_registry,
-                        session_state,
-                    )
-                    .with_schema_force_view_types(schema_force_view_types),
-                ) as Arc<dyn SchemaProvider>))
-            },
-            "paimon catalog access thread panicked",
-        )
-    }
-}
-
-impl PaimonCatalogProvider {
-    /// List one namespace without loading persistent table providers or losing catalog errors.
-    pub(super) async fn table_metadata(
-        &self,
-        database: &str,
-    ) -> DFResult<Vec<(String, TableType)>> {
-        let temp = self
-            .temp_tables
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(database)
-            .cloned();
-        let mut tables = HashMap::new();
-        match self.catalog.get_database(database).await {
-            Ok(_) => {
-                for name in self
-                    .catalog
-                    .list_tables(database)
-                    .await
-                    .map_err(to_datafusion_error)?
-                {
-                    tables.insert(name, TableType::Base);
-                }
-                let views = match self.catalog.list_views(database).await {
-                    Ok(views) => views,
-                    Err(paimon::Error::Unsupported { .. }) => Vec::new(),
-                    Err(error) => return Err(to_datafusion_error(error)),
-                };
-                for name in views {
-                    tables.entry(name).or_insert(TableType::View);
-                }
+        );
+        match exists {
+            Ok(_) => Some(Arc::new(PaimonSchemaProvider {
+                catalog: Arc::clone(&self.catalog),
+                database: name,
+                dynamic_options: Arc::clone(&self.dynamic_options),
+                blob_reader_registry: self.blob_reader_registry.clone(),
+                schema_force_view_types: self.schema_force_view_types,
+            })),
+            Err(paimon::Error::DatabaseNotExist { .. }) => None,
+            Err(error) => {
+                log::error!("failed to load Paimon database '{name}': {error}");
+                None
             }
-            Err(paimon::Error::DatabaseNotExist { .. }) if temp.is_some() => {}
-            Err(error) => return Err(to_datafusion_error(error)),
-        }
-        if let Some(temp) = temp {
-            for name in temp.table_names() {
-                if let Some(table_type) = temp.table_type(&name).await? {
-                    tables.insert(name, table_type);
-                }
-            }
-        }
-        Ok(tables.into_iter().collect())
-    }
-
-    /// Registers a temporary table or view in the specified database.
-    /// Creates the database if it does not exist.
-    ///
-    /// Returns an error if a temp table with the same name already exists in
-    /// the same database. Logs a warning if the name shadows a real Paimon table.
-    pub fn register_temp_table(
-        &self,
-        database: &str,
-        table_name: &str,
-        table: Arc<dyn TableProvider>,
-    ) -> DFResult<()> {
-        // Warn if this shadows a real Paimon table (outside the lock — not critical)
-        let catalog = Arc::clone(&self.catalog);
-        let db = database.to_string();
-        let tbl = table_name.to_string();
-        let identifier = Identifier::new(db, tbl);
-        if let Ok(true) = block_on_with_runtime(
-            async move {
-                match catalog.get_table(&identifier).await {
-                    Ok(_) => Ok::<bool, paimon::Error>(true),
-                    Err(paimon::Error::TableNotExist { .. }) => Ok(false),
-                    Err(_) => Ok(false),
-                }
-            },
-            "paimon catalog access thread panicked",
-        ) {
-            log::warn!(
-                "Temporary table '{database}.{table_name}' shadows an existing Paimon table"
-            );
-        }
-
-        // Atomically check-then-register under a single write lock to avoid TOCTOU
-        let mut databases = self.temp_tables.write().unwrap_or_else(|e| e.into_inner());
-        let mem_database = databases
-            .entry(database.to_string())
-            .or_insert_with(|| Arc::new(MemorySchemaProvider::new()));
-
-        // register_table returns Ok(Some(old_table)) if the name already existed
-        let old = mem_database.register_table(table_name.to_string(), table)?;
-        if old.is_some() {
-            return Err(plan_datafusion_err!(
-                "Temporary table '{database}.{table_name}' already exists"
-            ));
-        }
-        Ok(())
-    }
-
-    /// Deregisters a temporary table or view from the specified database.
-    pub fn deregister_temp_table(
-        &self,
-        database: &str,
-        table_name: &str,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let databases = self.temp_tables.read().unwrap_or_else(|e| e.into_inner());
-        let mem_database = databases
-            .get(database)
-            .ok_or_else(|| plan_datafusion_err!("Unknown temp database '{database}'"))?;
-        mem_database.deregister_table(table_name)
-    }
-
-    /// Returns whether a temp table database exists with the given name.
-    pub fn has_temp_table_database(&self, name: &str) -> bool {
-        self.temp_tables
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(name)
-    }
-
-    /// Returns whether a temp table with the given name exists in the specified database.
-    pub fn temp_table_exist(&self, database: &str, table_name: &str) -> bool {
-        let databases = self.temp_tables.read().unwrap_or_else(|e| e.into_inner());
-        databases
-            .get(database)
-            .is_some_and(|db| db.table_exist(table_name))
-    }
-
-    /// Returns the temp table or view with the given name in the specified database.
-    pub(crate) async fn temp_table(
-        &self,
-        database: &str,
-        table_name: &str,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let temp = self
-            .temp_tables
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(database)
-            .cloned();
-        match temp {
-            Some(temp) => temp.table(table_name).await,
-            None => Ok(None),
         }
     }
 }
 
-/// Represents a [`SchemaProvider`] for the Paimon [`Catalog`], managing
-/// access to table providers within a specific database.
-///
-/// Tables are loaded lazily when accessed via the `table()` method.
+/// Exposes tables in one Paimon database and loads them on demand.
+#[derive(Clone)]
 pub struct PaimonSchemaProvider {
-    catalog_name: Option<String>,
-    /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
-    /// Database name this schema represents.
     database: String,
-    /// Session-scoped dynamic options shared with the SQL context.
     dynamic_options: DynamicOptions,
-    /// Optional temporary in-memory provider for temp tables and views.
-    temp_provider: Option<Arc<MemorySchemaProvider>>,
-    /// Table types populated together with `table_names` for metadata-only lookups.
-    catalog_table_types: RwLock<HashMap<String, TableType>>,
     blob_reader_registry: BlobReaderRegistry,
-    session_state: Option<SessionStateProvider>,
     schema_force_view_types: bool,
-    /// Engines for table types served elsewhere; empty without routing.
-    table_engines: TableEngines,
 }
 
 impl Debug for PaimonSchemaProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PaimonSchemaProvider")
             .field("database", &self.database)
-            .field("has_temp_provider", &self.temp_provider.is_some())
-            .finish()
-    }
-}
-
-impl PaimonSchemaProvider {
-    /// Creates a new [`PaimonSchemaProvider`].
-    pub fn new(
-        catalog_name: Option<String>,
-        catalog: Arc<dyn Catalog>,
-        database: String,
-        dynamic_options: DynamicOptions,
-        temp_provider: Option<Arc<MemorySchemaProvider>>,
-        blob_reader_registry: BlobReaderRegistry,
-        session_state: Option<SessionStateProvider>,
-    ) -> Self {
-        PaimonSchemaProvider {
-            catalog_name,
-            catalog,
-            database,
-            dynamic_options,
-            temp_provider,
-            catalog_table_types: RwLock::new(HashMap::new()),
-            blob_reader_registry,
-            session_state,
-            schema_force_view_types: true,
-            table_engines: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    fn with_schema_force_view_types(mut self, schema_force_view_types: bool) -> Self {
-        self.schema_force_view_types = schema_force_view_types;
-        self
-    }
-
-    pub(crate) fn with_table_engines(mut self, table_engines: TableEngines) -> Self {
-        self.table_engines = table_engines;
-        self
-    }
-}
-
-impl PaimonSchemaProvider {
-    /// Resolve a metadata function's source through normal table handling,
-    /// without planning persistent view definitions. Temporary shadows remain
-    /// visible so the caller can reject a shadowing view or memory table.
-    pub(crate) async fn table_without_view_fallback(
-        &self,
-        name: &str,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        self.table_with_views(name, false).await
-    }
-
-    async fn table_with_views(
-        &self,
-        name: &str,
-        allow_views: bool,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        if let Some(temp) = &self.temp_provider {
-            if let Some(table) = temp.table(name).await? {
-                if allow_views {
-                    if let Some(view) =
-                        table.downcast_ref::<crate::partition_functions::MetadataView>()
-                    {
-                        let state = self.session_state.as_ref().and_then(|provider| provider()).ok_or_else(|| {
-                            plan_datafusion_err!("DataFusion session is unavailable while planning temporary view '{name}'")
-                        })?;
-                        return Ok(Some(Arc::new(Box::pin(view.resolve(&state)).await?)));
-                    }
-                }
-                return Ok(Some(table));
-            }
-        }
-
-        let object = system_tables::parse_object_name_for_datafusion(name)?;
-        let system_name = object.system_table().map(str::to_string);
-
-        let catalog = Arc::clone(&self.catalog);
-        let dynamic_options = Arc::clone(&self.dynamic_options);
-        let blob_reader_registry = self.blob_reader_registry.clone();
-        let catalog_name = self.catalog_name.clone();
-        let session_state = self.session_state.clone();
-        let schema_force_view_types = self.schema_force_view_types;
-        let identifier = Identifier::new(self.database.clone(), object.table().to_string());
-        let branch = object.branch().map(str::to_string);
-        let table_engines: HashMap<PaimonTableType, Arc<dyn TableEngineResolver>> = self
-            .table_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        await_with_runtime(async move {
-            match catalog.load_table(&identifier).await {
-                Ok(paimon::catalog::LoadedTable::Object(table)) => {
-                    if let Some(system_name) = &system_name {
-                        if !system_tables::is_registered(system_name) {
-                            return Ok(None);
-                        }
-                        return Err(plan_datafusion_err!(
-                            "table '{}' is declared 'object-table' and cannot be read as a Paimon table",
-                            identifier.full_name()
-                        ));
-                    }
-                    if branch.is_some() {
-                        return Err(plan_datafusion_err!(
-                            "branches are not supported for 'object-table' tables ('{}')",
-                            identifier.full_name()
-                        ));
-                    }
-                    let session_options = dynamic_options
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    paimon::spec::CoreOptions::new(&session_options)
-                        .ensure_engine_can_serve(&identifier.full_name())
-                        .map_err(to_datafusion_error)?;
-                    Ok(Some(Arc::new(ObjectTableProvider::try_new(
-                        table,
-                        schema_force_view_types,
-                    )?) as Arc<dyn TableProvider>))
-                }
-                Ok(paimon::catalog::LoadedTable::External(external)) => {
-                    let declared = external.declared();
-                    if branch.is_some() {
-                        return Err(plan_datafusion_err!(
-                            "branches are not supported for '{}' tables ('{}')",
-                            declared,
-                            identifier.full_name()
-                        ));
-                    }
-                    // Keep the metadata suffix in errors.
-                    let table_name = format!("{}.{}", identifier.database(), name);
-                    let Some(resolver) = table_engines.get(&declared) else {
-                        if system_name.is_some() {
-                            return Err(plan_datafusion_err!(
-                                "no table engine is registered for '{}' tables ('{}')",
-                                declared,
-                                table_name
-                            ));
-                        }
-                        let schema = match external.fields() {
-                            Some(fields) => crate::table::datafusion_arrow_schema(
-                                fields,
-                                schema_force_view_types,
-                            )?,
-                            None => Arc::new(datafusion::arrow::datatypes::Schema::empty()),
-                        };
-                        return Ok(Some(Arc::new(UnavailableEngineTableProvider {
-                            schema,
-                            declared,
-                            table_name: identifier.full_name(),
-                        }) as Arc<dyn TableProvider>));
-                    };
-                    // Engines cannot apply Paimon scan options or query authorization.
-                    let session_options = dynamic_options
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    paimon::spec::CoreOptions::new(&session_options)
-                        .ensure_engine_can_serve(&table_name)
-                        .map_err(to_datafusion_error)?;
-                    let request = EngineTableRequest::new(
-                        identifier.database().to_string(),
-                        identifier.object().to_string(),
-                        declared,
-                    );
-                    let metadata_table = system_name.is_some();
-                    let resolved = match system_name {
-                        Some(system_name) => {
-                            let system_name = system_name.to_ascii_lowercase();
-                            resolver.resolve_metadata_table(&request, &system_name).await?
-                        }
-                        None => resolver.resolve_table(&request).await?,
-                    };
-                    Ok(resolved.map(|inner| {
-                        Arc::new(ReadOnlyTableProvider {
-                            inner,
-                            declared,
-                            table_name,
-                            metadata_table,
-                            request,
-                            resolver: Arc::clone(resolver),
-                            dynamic_options,
-                        }) as Arc<dyn TableProvider>
-                    }))
-                }
-                Ok(paimon::catalog::LoadedTable::Paimon(table)) => {
-                    if let Some(system_name) = system_name {
-                        let opts = dynamic_options
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clone();
-                        return system_tables::load(
-                            catalog,
-                            identifier,
-                            *table,
-                            object,
-                            system_name,
-                            opts,
-                        )
-                        .await;
-                    }
-                    let mut table = *table;
-                    if let Some(branch) = branch.as_deref() {
-                        table = table
-                            .copy_with_branch(branch)
-                            .await
-                            .map_err(to_datafusion_error)?;
-                    }
-                    let opts = dynamic_options.read().unwrap().clone();
-                    let provider = if opts.is_empty() {
-                        PaimonTableProvider::try_new_with_blob_reader_registry(
-                            table,
-                            blob_reader_registry,
-                        )?
-                    } else {
-                        let table_definition = crate::table::build_table_definition(&table).ok();
-                        // Dynamic options may select a historical snapshot
-                        // (e.g. `SET 'paimon.scan.version'`); switch to its
-                        // schema so planning sees the snapshot's columns.
-                        let table = table
-                            .copy_with_time_travel(opts)
-                            .await
-                            .map_err(to_datafusion_error)?;
-                        PaimonTableProvider::try_new_with_blob_reader_registry_and_definition(
-                            table,
-                            blob_reader_registry,
-                            table_definition,
-                        )?
-                    }
-                    .with_schema_force_view_types(schema_force_view_types)?;
-                    Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
-                }
-                Err(paimon::Error::TableNotExist { .. }) => {
-                    if let Some(system_name) = system_name {
-                        return if system_tables::is_registered(&system_name) {
-                            Err(plan_datafusion_err!(
-                                "Cannot read system table `${system_name}`: base table `{}` does not exist",
-                                object.table()
-                            ))
-                        } else {
-                            Ok(None)
-                        };
-                    }
-                    if branch.is_some() {
-                        return Ok(None);
-                    }
-                    if !allow_views {
-                        return Ok(None);
-                    }
-                    // DataFusion preloads every relation name before planning, including
-                    // registered table functions. Do not reinterpret a missing UDTF name as
-                    // a REST view; the planner will resolve it through the UDTF registry.
-                    if session_state
-                        .as_ref()
-                        .and_then(|provider| provider())
-                        .is_some_and(|state| state.table_functions().contains_key(identifier.object()))
-                    {
-                        return Ok(None);
-                    }
-                    let view = match catalog.get_view(&identifier).await {
-                        Ok(view) => view,
-                        Err(paimon::Error::ViewNotExist { .. })
-                        | Err(paimon::Error::Unsupported { .. }) => return Ok(None),
-                        Err(error) => return Err(to_datafusion_error(error)),
-                    };
-                    let catalog_name = catalog_name.ok_or_else(|| {
-                        plan_datafusion_err!(
-                            "REST catalog view '{}' requires a session-aware catalog provider",
-                            identifier.full_name()
-                        )
-                    })?;
-                    validate_view_dependencies(&catalog, &catalog_name, &view)
-                        .await?;
-                    let mut state = session_state
-                        .and_then(|provider| provider())
-                        .ok_or_else(|| {
-                            plan_datafusion_err!(
-                                "DataFusion session is unavailable while planning REST catalog view '{}'",
-                                identifier.full_name()
-                            )
-                        })?;
-                    state.config_mut().options_mut().catalog.default_catalog =
-                        catalog_name.clone();
-                    state.config_mut().options_mut().catalog.default_schema =
-                        identifier.database().to_string();
-                    let catalogs =
-                        HashMap::from([(catalog_name.clone(), Arc::clone(&catalog))]);
-                    let query = crate::sql_function::expand_sql(
-                        &state,
-                        view.query_for("datafusion"),
-                        &catalogs,
-                        &catalog_name,
-                        identifier.database(),
-                    )
-                    .await?;
-                    let plan = crate::read_files::sql(
-                        &datafusion::prelude::SessionContext::new_with_state(state),
-                        &query,
-                        datafusion::execution::context::SQLOptions::new(),
-                    ).await?.into_unoptimized_plan();
-                    let plan = enforce_view_schema(plan, &view)?;
-                    Ok(Some(Arc::new(datafusion::datasource::ViewTable::new(
-                        plan,
-                        Some(query),
-                    )) as Arc<dyn TableProvider>))
-                }
-                Err(e) => Err(to_datafusion_error(e)),
-                Ok(_) => Err(plan_datafusion_err!(
-                    "catalog returned an unsupported loaded table kind for '{}'",
-                    identifier.full_name()
-                )),
-            }
-        })
-        .await
+            .finish_non_exhaustive()
     }
 }
 
@@ -1130,478 +135,64 @@ impl SchemaProvider for PaimonSchemaProvider {
     fn table_names(&self) -> Vec<String> {
         let catalog = Arc::clone(&self.catalog);
         let database = self.database.clone();
-        let (mut names, views) = block_on_with_runtime(
-            {
-                let db = database.clone();
-                async move {
-                    let names = match catalog.list_tables(&db).await {
-                        Ok(names) => names,
-                        Err(e) => {
-                            log::error!("failed to list tables in '{}': {e}", db);
-                            vec![]
-                        }
-                    };
-                    let views = match catalog.list_views(&db).await {
-                        Ok(views) => views,
-                        Err(paimon::Error::Unsupported { .. }) => vec![],
-                        Err(error) => {
-                            log::error!("failed to list views in '{}': {error}", db);
-                            vec![]
-                        }
-                    };
-                    (names, views)
-                }
+        block_on_with_runtime(
+            async move {
+                catalog
+                    .list_tables(&database)
+                    .await
+                    .unwrap_or_else(|error| {
+                        log::error!("failed to list Paimon tables in '{database}': {error}");
+                        vec![]
+                    })
             },
             "paimon catalog access thread panicked",
-        );
-
-        let mut catalog_table_types = HashMap::with_capacity(names.len() + views.len());
-        for name in &names {
-            catalog_table_types.insert(name.clone(), TableType::Base);
-        }
-        for view in views {
-            catalog_table_types
-                .entry(view.clone())
-                .or_insert(TableType::View);
-            names.push(view);
-        }
-        *self
-            .catalog_table_types
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = catalog_table_types;
-
-        if let Some(temp) = &self.temp_provider {
-            names.extend(temp.table_names());
-        }
-
-        let mut seen = std::collections::HashSet::new();
-        names.retain(|name| seen.insert(name.clone()));
-
-        names
+        )
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        self.table_with_views(name, true).await
-    }
-
-    async fn table_type(&self, name: &str) -> DFResult<Option<TableType>> {
-        if let Some(temp) = &self.temp_provider {
-            if let Some(table_type) = temp.table_type(name).await? {
-                return Ok(Some(table_type));
-            }
+        let identifier = Identifier::new(&self.database, name);
+        let parsed = identifier
+            .parsed_object_name()
+            .map_err(to_datafusion_error)?;
+        if parsed.system_table().is_some() {
+            return Ok(None);
         }
-
-        if let Some(table_type) = self
-            .catalog_table_types
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-        {
-            return Ok(Some(*table_type));
-        }
-
-        self.table(name)
-            .await
-            .map(|table| table.map(|table| table.table_type()))
+        let base = Identifier::new(&self.database, parsed.table());
+        let options = self.dynamic_options.read().unwrap().clone();
+        await_with_runtime(async {
+            let loaded = match self.catalog.load_table(&base).await {
+                Ok(loaded) => loaded,
+                Err(paimon::Error::TableNotExist { .. }) => return Ok(None),
+                Err(error) => return Err(to_datafusion_error(error)),
+            };
+            let (table, _, _) = loaded_table_for_read(loaded, &identifier).await?;
+            let definition = build_table_definition(&table).ok();
+            let table = if options.is_empty() {
+                table
+            } else {
+                table
+                    .copy_with_time_travel(options)
+                    .await
+                    .map_err(to_datafusion_error)?
+            };
+            let provider = PaimonTableProvider::try_new_with_blob_reader_registry_and_definition(
+                table,
+                self.blob_reader_registry.clone(),
+                definition,
+            )?
+            .with_schema_force_view_types(self.schema_force_view_types)?;
+            Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
+        })
+        .await
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        if let Some(temp) = &self.temp_provider {
-            if temp.table_exist(name) {
-                return true;
-            }
-        }
-
-        let object = match system_tables::parse_object_name_for_datafusion(name) {
-            Ok(object) => object,
-            Err(e) => {
-                log::error!("failed to parse Paimon object name '{name}': {e}");
-                return false;
-            }
-        };
-        let catalog = Arc::clone(&self.catalog);
-        let dynamic_options = Arc::clone(&self.dynamic_options);
-        let identifier = Identifier::new(self.database.clone(), object.table().to_string());
-        let branch = object.branch().map(str::to_string);
-        let is_branches_table = object
-            .system_table()
-            .is_some_and(|name| name.eq_ignore_ascii_case("branches"));
-        let system_name = object.system_table().map(str::to_string);
-        let has_system_suffix = system_name.is_some();
-        let table_name = format!("{}.{}", self.database, name);
-        let engines: HashMap<PaimonTableType, Arc<dyn TableEngineResolver>> = self
-            .table_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let provider = self.clone();
+        let name = name.to_owned();
         block_on_with_runtime(
-            async move {
-                match catalog.load_table(&identifier).await {
-                    Ok(paimon::catalog::LoadedTable::Object(_)) => {
-                        branch.is_none() && !has_system_suffix
-                    }
-                    Ok(paimon::catalog::LoadedTable::External(external)) => {
-                        let declared = external.declared();
-                        if branch.is_some() {
-                            return false;
-                        }
-                        match engines.get(&declared) {
-                            Some(resolver) => {
-                                let request = EngineTableRequest::new(
-                                    identifier.database().to_string(),
-                                    identifier.object().to_string(),
-                                    declared,
-                                );
-                                let resolved = async {
-                                    if let Some(system_name) = system_name {
-                                        let opts = dynamic_options
-                                            .read()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .clone();
-                                        paimon::spec::CoreOptions::new(&opts)
-                                            .ensure_engine_can_serve(&table_name)
-                                            .map_err(to_datafusion_error)?;
-                                        let system_name = system_name.to_ascii_lowercase();
-                                        resolver
-                                            .resolve_metadata_table(&request, &system_name)
-                                            .await
-                                    } else {
-                                        resolver.resolve_table(&request).await
-                                    }
-                                }
-                                .await;
-                                match resolved {
-                                    Ok(table) => table.is_some(),
-                                    // Let `table()` report the engine error.
-                                    Err(err) => {
-                                        log::warn!(
-                                            "failed to probe engine table existence for '{}': {err}",
-                                            table_name
-                                        );
-                                        true
-                                    }
-                                }
-                            }
-                            // Only base tables have a metadata-only fallback.
-                            None => !has_system_suffix,
-                        }
-                    }
-                    Ok(paimon::catalog::LoadedTable::Paimon(table)) => {
-                        if system_name
-                            .as_deref()
-                            .is_some_and(|name| !system_tables::is_registered(name))
-                        {
-                            return false;
-                        }
-                        if let Some(branch) = branch.as_deref() {
-                            if is_branches_table {
-                                return true;
-                            }
-                            (*table).copy_with_branch(branch).await.is_ok()
-                        } else {
-                            true
-                        }
-                    }
-                    Err(paimon::Error::TableNotExist { .. }) => {
-                        if branch.is_some() || has_system_suffix {
-                            return false;
-                        }
-                        match catalog.get_view(&identifier).await {
-                            Ok(_) => true,
-                            Err(paimon::Error::ViewNotExist { .. })
-                            | Err(paimon::Error::Unsupported { .. }) => false,
-                            Err(error) => {
-                                log::error!("failed to check view '{}': {error}", identifier);
-                                false
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("failed to check table '{}': {e}", identifier);
-                        false
-                    }
-                    Ok(_) => {
-                        log::error!(
-                            "catalog returned an unsupported loaded table kind for '{}'",
-                            identifier
-                        );
-                        false
-                    }
-                }
-            },
+            async move { provider.table(&name).await },
             "paimon catalog access thread panicked",
         )
-    }
-
-    fn register_table(
-        &self,
-        _name: String,
-        table: Arc<dyn TableProvider>,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        // DataFusion calls register_table after table creation, so we just
-        // acknowledge it here.
-        Ok(Some(table))
-    }
-
-    fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        // View DDL can reach this callback for metadata tables.
-        let object = system_tables::parse_object_name_for_datafusion(name)?;
-        if object.system_table().is_some() {
-            return Err(plan_datafusion_err!(
-                "Metadata table '{}.{}' is read-only",
-                self.database,
-                name
-            ));
-        }
-        let catalog = Arc::clone(&self.catalog);
-        let identifier = Identifier::new(self.database.clone(), name);
-        block_on_with_runtime(
-            async move {
-                // Try to get the table first so we can return it.
-                let table = match catalog.get_table(&identifier).await {
-                    Ok(t) => t,
-                    Err(paimon::Error::TableNotExist { .. }) => return Ok(None),
-                    Err(e) => return Err(to_datafusion_error(e)),
-                };
-                let provider = PaimonTableProvider::try_new(table)?;
-                catalog
-                    .drop_table(&identifier, false)
-                    .await
-                    .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
-            },
-            "paimon catalog access thread panicked",
-        )
-    }
-}
-
-fn enforce_view_schema(plan: LogicalPlan, view: &View) -> DFResult<LogicalPlan> {
-    let declared_fields = view.schema().fields();
-    let actual_fields = plan.schema().fields();
-    if actual_fields.len() != declared_fields.len() {
-        return Err(plan_datafusion_err!(
-            "REST catalog view '{}' declares {} fields but its query returns {}",
-            view.full_name(),
-            declared_fields.len(),
-            actual_fields.len()
-        ));
-    }
-
-    let expressions = declared_fields
-        .iter()
-        .enumerate()
-        .map(|(index, declared)| {
-            let (qualifier, actual) = plan.schema().qualified_field(index);
-            let column = match qualifier {
-                Some(qualifier) => Column::new(Some(qualifier.clone()), actual.name()),
-                None => Column::new_unqualified(actual.name()),
-            };
-            let target =
-                paimon::arrow::paimon_type_to_arrow_field(declared.name(), declared.data_type())
-                    .map_err(to_datafusion_error)?;
-            let expr = if target.extension_type_name().is_some() {
-                Expr::Cast(datafusion::logical_expr::Cast::new_from_field(
-                    Box::new(Expr::Column(column)),
-                    Arc::new(target),
-                ))
-            } else {
-                cast(Expr::Column(column), target.data_type().clone())
-            };
-            Ok(expr.alias(declared.name()))
-        })
-        .collect::<DFResult<Vec<_>>>()?;
-
-    LogicalPlanBuilder::from(plan).project(expressions)?.build()
-}
-
-const MAX_VIEW_DEPENDENCIES: usize = 64;
-
-async fn validate_view_dependencies(
-    catalog: &Arc<dyn Catalog>,
-    catalog_name: &str,
-    root: &View,
-) -> DFResult<()> {
-    let mut queue = VecDeque::from([root.clone()]);
-    let mut loaded = HashSet::from([root.identifier().clone()]);
-    let mut dependencies = HashMap::<Identifier, Vec<Identifier>>::new();
-
-    while let Some(view) = queue.pop_front() {
-        let candidates = view_relation_identifiers(&view, catalog_name)?;
-        let mut view_dependencies = Vec::new();
-        for identifier in candidates {
-            // Routed engine tables count as existing dependencies.
-            match catalog.load_table(&identifier).await {
-                Ok(_) => continue,
-                Err(paimon::Error::TableNotExist { .. })
-                | Err(paimon::Error::Unsupported { .. }) => {}
-                Err(error) => return Err(to_datafusion_error(error)),
-            }
-
-            let dependency = match catalog.get_view(&identifier).await {
-                Ok(view) => view,
-                Err(paimon::Error::ViewNotExist { .. })
-                | Err(paimon::Error::Unsupported { .. }) => continue,
-                Err(error) => return Err(to_datafusion_error(error)),
-            };
-            view_dependencies.push(identifier.clone());
-            if loaded.insert(identifier) {
-                if loaded.len() > MAX_VIEW_DEPENDENCIES {
-                    return Err(plan_datafusion_err!(
-                        "REST catalog view '{}' exceeds the dependency limit of {}",
-                        root.full_name(),
-                        MAX_VIEW_DEPENDENCIES
-                    ));
-                }
-                queue.push_back(dependency);
-            }
-        }
-        dependencies.insert(view.identifier().clone(), view_dependencies);
-
-        if let Some(cycle) = find_view_dependency_cycle(&dependencies) {
-            let path = cycle
-                .iter()
-                .map(Identifier::full_name)
-                .collect::<Vec<_>>()
-                .join(" -> ");
-            return Err(plan_datafusion_err!(
-                "recursive REST catalog view dependency detected: {path}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Identifier>> {
-    let regex_sql = crate::regex_operators::parseable_sql(view.query_for("datafusion"))?;
-    let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
-    let mut statements =
-        Parser::parse_sql(&GenericDialect {}, parseable.as_ref()).map_err(|error| {
-            plan_datafusion_err!(
-                "Invalid SQL for REST catalog view '{}': {error}",
-                view.full_name()
-            )
-        })?;
-    if statements.len() != 1 {
-        return Err(plan_datafusion_err!(
-            "REST catalog view '{}' must contain exactly one SQL statement",
-            view.full_name()
-        ));
-    }
-    let Some(Statement::Query(query)) = statements.first() else {
-        return Err(plan_datafusion_err!(
-            "REST catalog view '{}' must contain a single read-only query",
-            view.full_name()
-        ));
-    };
-
-    let mut identifiers = Vec::new();
-    crate::sql_function::visit_view_table_dependencies(query, true, &mut |relation| {
-        if let Some(identifier) =
-            relation_identifier(relation, catalog_name, view.identifier().database())
-        {
-            identifiers.push(identifier);
-        }
-        Ok(())
-    })?;
-    // Preserve all native metadata lookup edges too, including prefetch-only
-    // syntax, without interpreting every relation lookup as a physical binding.
-    let statement = datafusion::sql::parser::Statement::Statement(Box::new(statements.remove(0)));
-    let (prefetched, _) = datafusion::sql::resolve::resolve_table_references(&statement, true)?;
-    let mut seen = identifiers.iter().cloned().collect::<HashSet<_>>();
-    for reference in prefetched {
-        let resolved = reference.resolve(catalog_name, view.identifier().database());
-        if resolved.catalog.as_ref() == catalog_name {
-            let identifier =
-                Identifier::new(resolved.schema.to_string(), resolved.table.to_string());
-            if seen.insert(identifier.clone()) {
-                identifiers.push(identifier);
-            }
-        }
-    }
-    Ok(identifiers)
-}
-
-type SqlIdentifierKey = String;
-
-fn sql_identifier_key(identifier: &Ident) -> SqlIdentifierKey {
-    IdentNormalizer::default().normalize(identifier.clone())
-}
-
-fn relation_identifier(
-    relation: &ObjectName,
-    catalog_name: &str,
-    current_database: &str,
-) -> Option<Identifier> {
-    let parts = relation
-        .0
-        .iter()
-        .map(|part| part.as_ident().map(sql_identifier_key))
-        .collect::<Option<Vec<_>>>()?;
-    match parts.as_slice() {
-        [object] => Some(Identifier::new(current_database, object.as_str())),
-        [database, object] => Some(Identifier::new(database.as_str(), object.as_str())),
-        [catalog, database, object] if catalog == catalog_name => {
-            Some(Identifier::new(database.as_str(), object.as_str()))
-        }
-        _ => None,
-    }
-}
-
-fn find_view_dependency_cycle(
-    dependencies: &HashMap<Identifier, Vec<Identifier>>,
-) -> Option<Vec<Identifier>> {
-    fn visit(
-        identifier: &Identifier,
-        dependencies: &HashMap<Identifier, Vec<Identifier>>,
-        finished: &mut HashSet<Identifier>,
-        path: &mut Vec<Identifier>,
-    ) -> Option<Vec<Identifier>> {
-        if let Some(start) = path.iter().position(|entry| entry == identifier) {
-            let mut cycle = path[start..].to_vec();
-            cycle.push(identifier.clone());
-            return Some(cycle);
-        }
-        if finished.contains(identifier) {
-            return None;
-        }
-
-        path.push(identifier.clone());
-        if let Some(next_identifiers) = dependencies.get(identifier) {
-            for next in next_identifiers {
-                if let Some(cycle) = visit(next, dependencies, finished, path) {
-                    return Some(cycle);
-                }
-            }
-        }
-        path.pop();
-        finished.insert(identifier.clone());
-        None
-    }
-
-    let mut finished = HashSet::new();
-    for identifier in dependencies.keys() {
-        if let Some(cycle) = visit(identifier, dependencies, &mut finished, &mut Vec::new()) {
-            return Some(cycle);
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn relation_identifiers_follow_datafusion_normalization() {
-        let relation = ObjectName(vec![
-            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(Ident::new("PAIMON")),
-            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(Ident::new("DEFAULT")),
-            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(Ident::new("ANSWER_VIEW")),
-        ]);
-
-        assert_eq!(
-            relation_identifier(&relation, "paimon", "unused"),
-            Some(Identifier::new("default", "answer_view"))
-        );
+        .is_ok_and(|table| table.is_some())
     }
 }

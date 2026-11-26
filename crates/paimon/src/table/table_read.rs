@@ -2832,9 +2832,9 @@ fn value_equal_at(
         for offset in 0..left.value_length() {
             if !value_equal_at(
                 left.values().as_ref(),
-                (left.value_offset(left_row) + offset) as usize,
+                left.value_offset_at(left_row) + offset as usize,
                 right.values().as_ref(),
-                (right.value_offset(right_row) + offset) as usize,
+                right.value_offset_at(right_row) + offset as usize,
             )? {
                 return Ok(false);
             }

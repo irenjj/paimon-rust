@@ -412,7 +412,7 @@ fn build_arrow_schema(fields: &[DataField], for_read: bool) -> crate::Result<Arc
             let mut field = paimon_arrow_field(f.name(), f.data_type(), for_read)?;
             field
                 .metadata_mut()
-                .insert(PARQUET_FIELD_ID_META_KEY.into(), f.id().to_string());
+                .insert(PARQUET_FIELD_ID_META_KEY, f.id().to_string());
             Ok(with_generation_expression(field, f))
         })
         .collect::<crate::Result<Vec<_>>>()?;
@@ -463,10 +463,10 @@ fn paimon_arrow_field(
     .map_err(geoarrow_metadata_error)?;
     field
         .metadata_mut()
-        .insert(EXTENSION_TYPE_NAME_KEY.into(), GEOARROW_WKB.into());
+        .insert(EXTENSION_TYPE_NAME_KEY, GEOARROW_WKB);
     field
         .metadata_mut()
-        .insert(EXTENSION_TYPE_METADATA_KEY.into(), metadata);
+        .insert(EXTENSION_TYPE_METADATA_KEY, metadata);
     Ok(field)
 }
 

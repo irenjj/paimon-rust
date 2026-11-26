@@ -1890,7 +1890,7 @@ fn sort_merge_stream(
         let mut changelog_rows = 0;
         let changelog_schema = {
             let mut metadata = output_schema.metadata().clone();
-            metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
+            metadata.insert(CHANGELOG_BATCH_METADATA_KEY, "true");
             Arc::new(output_schema.as_ref().clone().with_metadata(metadata))
         };
         // Reused for every key, so grouping allocates nothing per key.

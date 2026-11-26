@@ -19,30 +19,28 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow::compute::cast;
+use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use async_trait::async_trait;
-use datafusion::arrow::array::{
-    Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, UInt32Array,
-};
-use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::catalog::Session;
-use datafusion::catalog::TableFunctionImpl;
-use datafusion::common::stats::Precision;
-use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{internal_err, project_schema, Statistics};
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
-use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
+use datafusion_catalog::TableProvider;
+use datafusion_catalog::{TableFunctionArgs, TableFunctionImpl};
+use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::{internal_err, project_schema, Statistics};
+use datafusion_common::{DataFusionError, Result as DFResult};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_expr::TableType;
+use datafusion_expr::{Expr, TableProviderFilterPushDown};
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion_physical_plan::empty::EmptyExec;
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     PlanProperties, ReplaceChildrenOptions, StatisticsArgs,
 };
-use datafusion::prelude::SessionContext;
+use datafusion_session::Session;
 use futures::{stream, TryStreamExt};
 use paimon::catalog::Catalog;
 use paimon::spec::{
@@ -62,30 +60,7 @@ use crate::DynamicOptions;
 
 const FUNCTION_NAME: &str = "vector_search";
 
-pub fn register_vector_search(
-    ctx: &SessionContext,
-    catalog: Arc<dyn Catalog>,
-    default_database: &str,
-) {
-    register_vector_search_with_dynamic_options(ctx, catalog, default_database, Default::default());
-}
-
-pub(crate) fn register_vector_search_with_dynamic_options(
-    ctx: &SessionContext,
-    catalog: Arc<dyn Catalog>,
-    default_database: &str,
-    dynamic_options: DynamicOptions,
-) {
-    ctx.register_udtf(
-        "vector_search",
-        Arc::new(VectorSearchFunction::new_with_dynamic_options(
-            catalog,
-            default_database,
-            dynamic_options,
-        )),
-    );
-}
-
+/// Table function implementation for `vector_search`.
 pub struct VectorSearchFunction {
     catalog: Arc<dyn Catalog>,
     default_database: String,
@@ -105,7 +80,8 @@ impl VectorSearchFunction {
         Self::new_with_dynamic_options(catalog, default_database, Default::default())
     }
 
-    pub(crate) fn new_with_dynamic_options(
+    /// Creates a table function that applies the host session’s read options.
+    pub fn new_with_dynamic_options(
         catalog: Arc<dyn Catalog>,
         default_database: &str,
         dynamic_options: DynamicOptions,
@@ -136,9 +112,10 @@ impl VectorQuery {
 }
 
 impl TableFunctionImpl for VectorSearchFunction {
-    fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs<'_, '_>) -> DFResult<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != 4 {
-            return Err(datafusion::error::DataFusionError::Plan(
+            return Err(datafusion_common::DataFusionError::Plan(
                 "vector_search requires 4 arguments: (table_name, column_name, query_vector_json, limit)".to_string(),
             ));
         }
@@ -176,19 +153,7 @@ impl TableFunctionImpl for VectorSearchFunction {
 
         let inner = PaimonTableProvider::try_new(table)?;
         let query_vector_json =
-            match extract_string_literal(FUNCTION_NAME, &args[2], "query_vector_json") {
-                Ok(value) => value,
-                Err(_) if matches!(args[2], Expr::Column(_)) => {
-                    return Ok(Arc::new(LateralVectorSearchTableProvider {
-                        inner,
-                        column_name,
-                        query_vector_expr: args[2].clone(),
-                        limit: limit as usize,
-                    }));
-                }
-                Err(err) => return Err(err),
-            };
-
+            extract_string_literal(FUNCTION_NAME, &args[2], "query_vector_json")?;
         let query_vector = VectorQuery::parse(&query_vector_json).map_err(|e| {
             DataFusionError::Plan(format!(
                 "vector_search: query_vector_json must be a JSON vector or matrix of floats, got '{}': {}",
@@ -208,55 +173,6 @@ impl TableFunctionImpl for VectorSearchFunction {
             query_vector,
             limit: limit as usize,
         }))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct LateralVectorSearchTableProvider {
-    inner: PaimonTableProvider,
-    column_name: String,
-    query_vector_expr: Expr,
-    limit: usize,
-}
-
-impl LateralVectorSearchTableProvider {
-    pub(crate) fn inner(&self) -> &PaimonTableProvider {
-        &self.inner
-    }
-
-    pub(crate) fn column_name(&self) -> &str {
-        &self.column_name
-    }
-
-    pub(crate) fn query_vector_expr(&self) -> &Expr {
-        &self.query_vector_expr
-    }
-
-    pub(crate) fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-#[async_trait]
-impl TableProvider for LateralVectorSearchTableProvider {
-    fn schema(&self) -> ArrowSchemaRef {
-        self.inner.schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Plan(
-            "lateral vector_search must be planned through a lateral join".to_string(),
-        ))
     }
 }
 
@@ -281,7 +197,7 @@ impl TableProvider for VectorSearchTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -311,7 +227,7 @@ impl TableProvider for VectorSearchTableProvider {
             self.query_vector.clone(),
             self.limit,
             limit,
-            projection.cloned(),
+            projection.map(<[usize]>::to_vec),
             projected_schema,
         );
         if let Some(filter) = pushed_predicate {
@@ -440,7 +356,7 @@ impl VectorSearchExec {
 
         // Read the projected columns (+ internal `_ROW_ID`); the row-range scan yields
         // file order, realigned to relevance rank below.
-        let read_fields = projected_read_fields(&search_table, self.projection.as_ref())?;
+        let read_fields = projected_read_fields(&search_table, self.projection.as_deref())?;
         let row_ranges = search_result.to_row_ranges().map_err(to_datafusion_error)?;
         let batches = await_with_runtime(async {
             let mut read_builder = search_table.new_read_builder();
@@ -552,7 +468,7 @@ impl ExecutionPlan for VectorSearchExec {
 /// Errors if the table has no row tracking, since results then can't be ordered.
 fn projected_read_fields(
     table: &paimon::table::Table,
-    projection: Option<&Vec<usize>>,
+    projection: Option<&[usize]>,
 ) -> DFResult<Vec<DataField>> {
     let base_fields = datafusion_read_fields(table);
     let mut read_fields: Vec<DataField> = match projection {
@@ -660,13 +576,17 @@ fn gather_rows_by_rank(
 
 #[cfg(test)]
 mod tests {
-    use datafusion::catalog::TableFunctionArgs;
-    use datafusion::logical_expr::lit;
-    use paimon::spec::SCAN_VERSION_OPTION;
-    use paimon::{CatalogOptions, FileSystemCatalog, Options};
-
     use super::*;
-    use crate::SQLContext;
+    use arrow::array::{
+        ArrayRef, Float32Builder, Int32Array, LargeBinaryArray, ListBuilder, StringArray,
+    };
+    use datafusion_expr::lit;
+    use paimon::catalog::Identifier;
+    use paimon::spec::{
+        ArrayType, BlobDescriptor, BlobType, DataType, FloatType, IntType, Schema as PaimonSchema,
+        VarCharType,
+    };
+    use paimon::{CatalogOptions, FileSystemCatalog, Options};
 
     #[test]
     fn vector_query_accepts_decimal_vectors_and_matrices() {
@@ -682,119 +602,219 @@ mod tests {
     }
 
     #[test]
-    fn unfiltered_snapshot_io_uses_runtime_bridge_when_polled_without_tokio() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let table = crate::runtime::runtime().block_on(async {
+    fn indexed_search_and_descriptor_scan_work_without_entered_runtime() {
+        use arrow::datatypes::{DataType as ArrowDataType, Field};
+        use datafusion_physical_plan::{collect, StatisticsContext};
+
+        let warehouse = tempfile::tempdir().unwrap();
+        let payload = warehouse.path().join("missing-payload.bin");
+        let descriptor = BlobDescriptor::new(format!("file://{}", payload.display()), 0, 7);
+        let descriptor_bytes = descriptor.serialize();
+        let (catalog, identifier, snapshot_id) = crate::runtime::runtime().block_on(async {
             let mut options = Options::new();
-            options.set(CatalogOptions::WAREHOUSE, format!("file://{}", temp_dir.path().display()));
+            options.set(
+                CatalogOptions::WAREHOUSE,
+                warehouse.path().to_str().unwrap(),
+            );
             let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
-            let mut context = SQLContext::new();
-            context.register_catalog("paimon", catalog.clone()).await.unwrap();
-            context.sql("CREATE TABLE paimon.default.no_runtime_vectors (id INT, embedding ARRAY<FLOAT>) \
-                WITH ('data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true')")
-                .await.unwrap();
-            context.sql("INSERT INTO paimon.default.no_runtime_vectors (id) VALUES (1)")
-                .await.unwrap().collect().await.unwrap();
-            catalog.get_table(&paimon::catalog::Identifier::new("default", "no_runtime_vectors"))
-                .await.unwrap()
+            catalog
+                .create_database("db", false, Default::default())
+                .await
+                .unwrap();
+            let identifier = Identifier::new("db", "vector_blob");
+            let schema = PaimonSchema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column(
+                    "embedding",
+                    DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+                )
+                .column("picture", DataType::Blob(BlobType::new()))
+                .column("content", DataType::VarChar(VarCharType::string_type()))
+                .option("blob-descriptor-field", "picture")
+                .option("bucket", "-1")
+                .option("file.format", "parquet")
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .option("global-index.enabled", "true")
+                .option("global-index.search-mode", "full")
+                .build()
+                .unwrap();
+            catalog
+                .create_table(&identifier, schema, false)
+                .await
+                .unwrap();
+            let table = catalog.get_table(&identifier).await.unwrap();
+            let builder = table.new_write_builder();
+            let mut values = ListBuilder::new(Float32Builder::new()).with_field(Arc::new(
+                Field::new("element", ArrowDataType::Float32, true),
+            ));
+            values.values().append_slice(&[1.0, 0.0]);
+            values.append(true);
+            let batch = RecordBatch::try_from_iter([
+                ("id", Arc::new(Int32Array::from(vec![7])) as ArrayRef),
+                ("embedding", Arc::new(values.finish()) as ArrayRef),
+                (
+                    "picture",
+                    Arc::new(LargeBinaryArray::from(vec![descriptor_bytes.as_slice()])) as ArrayRef,
+                ),
+                (
+                    "content",
+                    Arc::new(StringArray::from(vec!["paimon lake"])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let mut writer = builder.new_write().unwrap();
+            writer.write_arrow_batch(&batch).await.unwrap();
+            builder
+                .new_commit()
+                .commit(writer.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+            let mut vector_index = table.new_global_index_build_builder();
+            vector_index
+                .with_index_type("ivf-flat")
+                .with_index_column("embedding")
+                .with_options(std::collections::HashMap::from([
+                    ("ivf-flat.dimension".into(), "2".into()),
+                    ("ivf-flat.nlist".into(), "1".into()),
+                    ("ivf-flat.distance.metric".into(), "l2".into()),
+                ]));
+            assert!(vector_index.execute().await.unwrap() > 0);
+            let mut text_index = table.new_global_index_build_builder();
+            text_index
+                .with_index_type("full-text")
+                .with_index_column("content");
+            assert!(text_index.execute().await.unwrap() > 0);
+            let snapshot_id = table.resolve_read_snapshot().await.unwrap().unwrap().id();
+            (catalog, identifier, snapshot_id)
         });
+
         assert!(tokio::runtime::Handle::try_current().is_err());
-        let exec = VectorSearchExec::new(
-            table,
-            "embedding".into(),
-            VectorQuery::Single(vec![1.0]),
-            1,
-            None,
-            None,
-            Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+        let dynamic_options = Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([
+            ("blob-as-descriptor".to_string(), "true".to_string()),
+            (
+                paimon::spec::SCAN_VERSION_OPTION.to_string(),
+                snapshot_id.to_string(),
+            ),
+        ])));
+        let catalog: Arc<dyn Catalog> = catalog;
+        let session = crate::test_session::TestSession::new(Default::default());
+        let vector = VectorSearchFunction::new_with_dynamic_options(
+            Arc::clone(&catalog),
+            "db",
+            Arc::clone(&dynamic_options),
         );
-        let batch = futures::executor::block_on(exec.compute_batch()).unwrap();
-        assert_eq!(batch.num_rows(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_vector_search_applies_supported_session_dynamic_options() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut catalog_options = Options::new();
-        catalog_options.set(
-            CatalogOptions::WAREHOUSE,
-            format!("file://{}", temp_dir.path().display()),
-        );
-        let catalog = Arc::new(FileSystemCatalog::new(catalog_options).unwrap());
-
-        let mut sql_context = SQLContext::new();
-        sql_context
-            .register_catalog("paimon", catalog)
-            .await
+        let vector_provider = vector
+            .call_with_args(TableFunctionArgs::new(
+                &[
+                    lit(identifier.object()),
+                    lit("embedding"),
+                    lit("[1.0, 0.0]"),
+                    lit(1_i64),
+                ],
+                &session,
+            ))
             .unwrap();
-        sql_context
-            .sql(
-                "CREATE TABLE paimon.default.vector_blob (\
-                    id INT, \
-                    embedding ARRAY<FLOAT>, \
-                    picture BLOB\
-                ) WITH (\
-                    'data-evolution.enabled' = 'true', \
-                    'row-tracking.enabled' = 'true'\
-                )",
-            )
-            .await
-            .unwrap();
-        sql_context
-            .sql("INSERT INTO paimon.default.vector_blob (id) VALUES (1)")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        sql_context
-            .sql("SET 'paimon.blob-as-descriptor' = 'true'")
-            .await
-            .unwrap();
-        sql_context
-            .sql("SET 'paimon.scan.version' = '1'")
-            .await
-            .unwrap();
-
-        let state = sql_context.ctx().state();
-        let table_function = state
-            .table_functions()
-            .get(FUNCTION_NAME)
-            .expect("vector_search should be registered");
-        let args = [
-            lit("paimon.default.vector_blob"),
-            lit("embedding"),
-            lit("[1.0]"),
-            lit(1_i64),
-        ];
-        let provider = table_function
-            .create_table_provider_with_args(TableFunctionArgs::new(&args, &state))
-            .unwrap();
-        let provider = provider
-            .downcast_ref::<VectorSearchTableProvider>()
-            .expect("vector_search should return its table provider");
-
-        assert!(
-            CoreOptions::new(provider.inner.table().schema().options()).blob_as_descriptor(),
-            "vector_search should apply session dynamic options to the loaded table"
-        );
-        assert!(
-            provider
-                .inner
-                .table()
-                .schema()
-                .options()
-                .contains_key(SCAN_VERSION_OPTION),
-            "vector_search should keep session time-travel options"
-        );
         assert_eq!(
-            provider
+            vector_provider
+                .downcast_ref::<VectorSearchTableProvider>()
+                .unwrap()
                 .inner
                 .table()
                 .travel_snapshot()
                 .map(|snapshot| snapshot.id()),
-            Some(1),
-            "vector_search should resolve the session time-travel snapshot"
+            Some(snapshot_id)
         );
+
+        let full_text = crate::FullTextSearchFunction::new_with_dynamic_options(
+            Arc::clone(&catalog),
+            "db",
+            Arc::clone(&dynamic_options),
+        );
+        let full_text_provider = full_text
+            .call_with_args(TableFunctionArgs::new(
+                &[
+                    lit(identifier.object()),
+                    lit("content"),
+                    lit("paimon"),
+                    lit(1_i64),
+                ],
+                &session,
+            ))
+            .unwrap();
+
+        use datafusion_functions::core::expr_fn::named_struct;
+        use datafusion_functions_nested::expr_fn::make_array;
+        let hybrid = crate::HybridSearchFunction::new_with_dynamic_options(
+            Arc::clone(&catalog),
+            "db",
+            Arc::clone(&dynamic_options),
+        );
+        let hybrid_provider = hybrid
+            .call_with_args(TableFunctionArgs::new(
+                &[
+                    lit(identifier.object()),
+                    make_array(vec![named_struct(vec![
+                        lit("field"),
+                        lit("embedding"),
+                        lit("query_vector"),
+                        make_array(vec![lit(1.0_f32), lit(0.0_f32)]),
+                    ])]),
+                    make_array(vec![named_struct(vec![
+                        lit("column"),
+                        lit("content"),
+                        lit("query"),
+                        lit(r#"{"match":{"query":"paimon"}}"#),
+                    ])]),
+                    lit(1_i64),
+                ],
+                &session,
+            ))
+            .unwrap();
+
+        let catalog =
+            crate::PaimonCatalogProvider::new(catalog, dynamic_options, Default::default());
+        use datafusion_catalog::CatalogProvider;
+        let schema = catalog.schema("db").unwrap();
+        assert!(schema.table_exist(identifier.object()));
+        futures::executor::block_on(async {
+            let table_provider = schema.table(identifier.object()).await.unwrap().unwrap();
+            for provider in [
+                table_provider,
+                vector_provider,
+                full_text_provider,
+                hybrid_provider,
+            ] {
+                let plan = provider
+                    .scan(&session, Some(&[0, 2]), &[], None)
+                    .await
+                    .unwrap();
+                let statistics = StatisticsContext::new()
+                    .compute(plan.as_ref(), &StatisticsArgs::new())
+                    .unwrap();
+                assert_eq!(
+                    statistics.column_statistics.len(),
+                    plan.schema().fields().len()
+                );
+                let batches = collect(plan, session.task_ctx()).await.unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                let id = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                assert_eq!(id.values(), &[7]);
+                let blob = batches[0]
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .unwrap();
+                assert_eq!(
+                    BlobDescriptor::deserialize(blob.value(0)).unwrap(),
+                    descriptor
+                );
+            }
+        });
+        assert!(!payload.exists());
     }
 }
