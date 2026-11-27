@@ -3535,6 +3535,17 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
     result
 }
 
+#[cfg(test)]
+pub(crate) fn write_parquet_fixture(batches: &[RecordBatch]) -> Bytes {
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(Vec::new(), batches[0].schema(), None).unwrap();
+    for batch in batches {
+        writer.write(batch).unwrap();
+        writer.flush().unwrap();
+    }
+    Bytes::from(writer.into_inner().unwrap())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -4473,8 +4484,8 @@ mod tests {
 
         let bytes = write_multi_page_parquet(10, 80).await;
         let metadata = load_metadata_with_page_index(&bytes, true);
-        let offset_index = &metadata.offset_index().unwrap()[0];
-        let page_locations = offset_index[0].page_locations();
+        let offset_index = metadata.page_index().unwrap().offset_index(0, 0).unwrap();
+        let page_locations = offset_index.page_locations();
         let compressed_bytes = page_locations
             .iter()
             .map(|page| i64::from(page.compressed_page_size))
@@ -5065,11 +5076,14 @@ mod tests {
         .unwrap();
         let metadata = reader.metadata().clone();
         assert!(metadata.num_row_groups() > 1);
-        let offsets = metadata.offset_index().expect("page index");
-        for (row_group, columns) in metadata.row_groups().iter().zip(offsets) {
+        let page_index = metadata.page_index().expect("page index");
+        for (row_group_index, row_group) in metadata.row_groups().iter().enumerate() {
             assert!(row_group.compressed_size() <= 2 * 16384);
-            for column in columns {
-                let firsts = column
+            for column_index in 0..row_group.num_columns() {
+                let offset_index = page_index
+                    .offset_index(row_group_index, column_index)
+                    .unwrap();
+                let firsts = offset_index
                     .page_locations()
                     .iter()
                     .map(|page| page.first_row_index)
@@ -5965,8 +5979,7 @@ mod tests {
         let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, false).await;
         let metadata = load_metadata_with_page_index(&bytes, false);
         assert_eq!(metadata.row_groups().len(), 2);
-        assert!(metadata.column_index().is_none());
-        assert!(metadata.offset_index().is_none());
+        assert!(metadata.page_index().is_none());
         let fields = vec![int_field("id"), int_field("value")];
 
         let outside = vec![id_leaf(
@@ -6117,7 +6130,7 @@ mod tests {
     async fn test_parquet_granules_uses_row_groups_when_page_index_disabled() {
         let bytes = Bytes::from(write_multi_page_parquet(10, 80).await);
         let metadata = load_metadata_with_page_index(&bytes, true);
-        assert!(metadata.offset_index().is_some());
+        assert!(metadata.page_index().unwrap().offset_index(0, 0).is_some());
         let (granules, page_level) = parquet_granules(
             Box::new(TrackingFileRead::new(bytes.clone())),
             bytes.len() as u64,
@@ -7047,7 +7060,8 @@ mod tests {
         writer.close().await.unwrap();
         let metadata = load_metadata_with_page_index(&data, true);
         assert_eq!(metadata.num_row_groups(), 4);
-        let pages = metadata.offset_index().unwrap()[0][0].page_locations();
+        let offset_index = metadata.page_index().unwrap().offset_index(0, 0).unwrap();
+        let pages = offset_index.page_locations();
         assert!(
             pages[1].compressed_page_size > pages[0].compressed_page_size * 100,
             "adjacent equal-row-count pages must have very different compression ratios"

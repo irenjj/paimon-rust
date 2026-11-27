@@ -1125,7 +1125,15 @@ fn unsupported_format_is_rejected_before_a_writer_is_opened() {
 
 #[tokio::test]
 async fn java_format_table_formats_round_trip() {
-    for format in ["parquet", "orc", "csv", "json", "mosaic"] {
+    for format in [
+        "parquet",
+        #[cfg(feature = "format-orc")]
+        "orc",
+        "csv",
+        "json",
+        #[cfg(feature = "format-mosaic")]
+        "mosaic",
+    ] {
         let table = memory_table(
             &format!("format_{format}_round_trip"),
             true,
@@ -1146,6 +1154,7 @@ async fn java_format_table_formats_round_trip() {
     }
 }
 
+#[cfg(feature = "format-orc")]
 #[tokio::test]
 async fn orc_format_table_reads_hive_empty_files_as_empty() {
     let table = memory_table("format_orc_hive_empty", true, &[("file.format", "orc")]);
@@ -1160,6 +1169,7 @@ async fn orc_format_table_reads_hive_empty_files_as_empty() {
     assert_eq!(ids(&table).await, [1, 2]);
 }
 
+#[cfg(feature = "format-orc")]
 #[tokio::test]
 async fn orc_format_table_reports_corrupt_nonempty_files() {
     let table = memory_table("format_orc_corrupt", false, &[("file.format", "orc")]);

@@ -17,46 +17,32 @@
 
 [workspace]
 resolver = "2"
-members = [
-    "crates/paimon",
-    "crates/integrations/datafusion",
-]
+members = ["crates/integrations/datafusion"]
+# Cargo resolves the entire workspace when building its lockfile, even with -p.
+exclude = ["crates/paimon"]
 
 [workspace.package]
 version = "0.6.0"
 edition = "2021"
-homepage = "https://paimon.apache.org/docs/rust/"
-repository = "https://github.com/apache/paimon-rust"
 license = "Apache-2.0"
 rust-version = "1.95.0"
 
 [workspace.dependencies]
 arrow = "60.2.0"
-arrow-array = { version = "60.2.0", features = ["ffi"] }
-arrow-arith = "60.2.0"
-arrow-buffer = "60.2.0"
-arrow-schema = "60.2.0"
-arrow-cast = "60.2.0"
-arrow-ipc = "60.2.0"
-arrow-json = "60.2.0"
-arrow-ord = "60.2.0"
-arrow-row = "60.2.0"
 arrow-select = "60.2.0"
-arrow-string = "60.2.0"
-datafusion-common = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/common" }
-datafusion-expr = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/expr" }
-datafusion-session = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/session" }
-datafusion-catalog = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/catalog" }
-datafusion-datasource = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/datasource" }
-datafusion-datasource-parquet = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/datasource-parquet" }
-datafusion-execution = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/execution" }
-datafusion-physical-plan = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/physical-plan" }
-datafusion-physical-expr = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/physical-expr" }
-datafusion-physical-expr-adapter = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/physical-expr-adapter" }
-datafusion-functions-nested = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/functions-nested" }
-datafusion-physical-expr-common = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/physical-expr-common" }
-datafusion-functions = { path = "/home/renjj/.paseo/worktrees/0k1e574a/df-lake-plan/datafusion/functions" }
+datafusion-common = { version = "=57.0.0-dev", default-features = false }
+datafusion-expr = { version = "=57.0.0-dev", default-features = false }
+datafusion-session = { version = "=57.0.0-dev", default-features = false }
+datafusion-catalog = { version = "=57.0.0-dev", default-features = false }
+datafusion-datasource = { version = "=57.0.0-dev", default-features = false }
+datafusion-datasource-parquet = { version = "=57.0.0-dev", default-features = false }
+datafusion-execution = { version = "=57.0.0-dev", default-features = false }
+datafusion-physical-plan = { version = "=57.0.0-dev", default-features = false }
+datafusion-physical-expr = { version = "=57.0.0-dev", default-features = false }
+datafusion-physical-expr-adapter = { version = "=57.0.0-dev", default-features = false }
+datafusion-functions-nested = { version = "=57.0.0-dev", default-features = false }
+datafusion-physical-expr-common = { version = "=57.0.0-dev", default-features = false }
+datafusion-functions = { version = "=57.0.0-dev", default-features = false }
 paimon = { version = "0.6.0", path = "crates/paimon", default-features = false }
 parquet = "60.2.0"
 tokio = "1.39.2"
-tokio-util = "0.7"

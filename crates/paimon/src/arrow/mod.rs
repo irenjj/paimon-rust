@@ -546,15 +546,15 @@ mod tests {
 
         let mut field = ArrowField::new("geom", ArrowDataType::Binary, true);
         field.metadata_mut().insert(
-            arrow_schema::extension::EXTENSION_TYPE_NAME_KEY.into(),
-            GEOARROW_WKB.into(),
+            arrow_schema::extension::EXTENSION_TYPE_NAME_KEY,
+            GEOARROW_WKB,
         );
         for (metadata, expected) in [
             (format!(r#"{{"crs":{projjson}}}"#), projjson.trim()),
             ("{}".to_owned(), "srid:0"),
         ] {
             field.metadata_mut().insert(
-                arrow_schema::extension::EXTENSION_TYPE_METADATA_KEY.into(),
+                arrow_schema::extension::EXTENSION_TYPE_METADATA_KEY,
                 metadata,
             );
             assert_eq!(

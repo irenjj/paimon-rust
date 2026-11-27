@@ -3142,10 +3142,13 @@ pub(in crate::table) mod tests {
         let names = (0..131_072).map(|id| (id % 10).to_string()).collect();
         let default_limit = parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT as i64;
         for (path, metadata) in write_sizing_batch(&file_io, &table, &sizing_batch(names)).await {
-            let offsets = metadata.offset_index().expect("page index");
-            for (row_group, columns) in metadata.row_groups().iter().zip(offsets) {
-                for column in columns {
-                    let firsts = column
+            let page_index = metadata.page_index().expect("page index");
+            for (row_group_index, row_group) in metadata.row_groups().iter().enumerate() {
+                for column_index in 0..row_group.num_columns() {
+                    let offset_index = page_index
+                        .offset_index(row_group_index, column_index)
+                        .unwrap();
+                    let firsts = offset_index
                         .page_locations()
                         .iter()
                         .map(|page| page.first_row_index)

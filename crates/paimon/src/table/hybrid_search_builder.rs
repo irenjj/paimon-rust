@@ -1469,6 +1469,7 @@ mod tests {
         );
 
         assert_eq!(ranked.row_ids, vec![2]);
+        assert!((ranked.scores[0] - (1.0 / 61.0 + 1.0 / 62.0)).abs() < 1e-6);
     }
 
     #[test]
@@ -1946,7 +1947,7 @@ mod pk_hybrid_tests {
                 HashMap::new(),
             )
             .unwrap();
-        builder.with_limit(3).with_rrf_ranker();
+        builder.with_limit(3);
 
         let batches = builder
             .execute_read()
@@ -1967,10 +1968,13 @@ mod pk_hybrid_tests {
         // position column is stripped.
         let scores = column_f32(&batches, SEARCH_SCORE_COLUMN);
         assert_eq!(scores.len(), 3);
-        assert!(
-            scores[0] >= scores[1] && scores[1] >= scores[2],
-            "scores must be best-first: {scores:?}"
-        );
+        for (score, expected) in
+            scores
+                .iter()
+                .zip([1.0 / 61.0 + 1.0 / 62.0, 1.0 / 63.0 + 1.0 / 61.0, 1.0 / 62.0])
+        {
+            assert!((score - expected).abs() < 1e-6);
+        }
         for batch in &batches {
             assert!(
                 batch

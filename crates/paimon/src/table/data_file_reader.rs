@@ -2767,6 +2767,7 @@ mod row_tests {
 mod tests {
     use super::*;
     use crate::arrow::build_target_arrow_schema;
+    use crate::arrow::format::parquet::write_parquet_fixture;
     use crate::common::Options;
     use crate::file_index::file_index_result::FileIndexResult;
     use crate::file_index::file_indexer_factory::{
@@ -2776,16 +2777,19 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        ArrayType, BigIntType, DataFileMeta, DataType, Datum, IntType, Predicate, PredicateBuilder,
+        BigIntType, DataFileMeta, DataType, Datum, IntType, Predicate, PredicateBuilder,
         PredicateOperator, Schema, SchemaChange, TableSchema, VarCharType,
     };
     use crate::table::source::{DataSplitBuilder, DeletionFile};
     use arrow_array::{Int32Array, StringArray};
     use bytes::Bytes;
     use futures::TryStreamExt;
+    #[cfg(feature = "format-mosaic")]
     use paimon_mosaic_core::spec::COMPRESSION_NONE;
+    #[cfg(feature = "format-mosaic")]
     use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use roaring::RoaringBitmap;
+    #[cfg(feature = "format-mosaic")]
     use std::io;
 
     #[test]
@@ -3028,16 +3032,19 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "format-mosaic")]
     struct MemOutputFile {
         data: Vec<u8>,
     }
 
+    #[cfg(feature = "format-mosaic")]
     impl MemOutputFile {
         fn new() -> Self {
             Self { data: Vec::new() }
         }
     }
 
+    #[cfg(feature = "format-mosaic")]
     impl OutputFile for MemOutputFile {
         fn write(&mut self, data: &[u8]) -> io::Result<()> {
             self.data.extend_from_slice(data);
@@ -3083,6 +3090,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "format-mosaic")]
     fn write_mosaic(batch: &RecordBatch) -> Bytes {
         let out = MemOutputFile::new();
         let mut writer = MosaicWriter::new(
@@ -3129,9 +3137,10 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(feature = "format-mosaic")]
     #[tokio::test]
     async fn test_mosaic_timestamp_zero_read_filter_and_row_selection() {
-        use crate::spec::{LocalZonedTimestampType, MapType, TimestampType};
+        use crate::spec::{ArrayType, LocalZonedTimestampType, MapType, TimestampType};
         use arrow_array::builder::{ListBuilder, TimestampMillisecondBuilder};
         use arrow_array::{ArrayRef, MapArray, StructArray, TimestampMillisecondArray};
         use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -3324,6 +3333,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "format-mosaic")]
     #[tokio::test]
     async fn test_mosaic_physical_missing_column_is_null_filled() {
         let physical_fields = vec![
@@ -3441,6 +3451,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "format-mosaic")]
     fn write_multi_row_group_mosaic(batches: &[RecordBatch], stats_columns: Vec<String>) -> Bytes {
         let out = MemOutputFile::new();
         let mut writer = MosaicWriter::new(
@@ -3461,15 +3472,6 @@ mod tests {
         }
         writer.close().unwrap();
         Bytes::from(writer.output().data.to_vec())
-    }
-
-    fn write_parquet(batch: &RecordBatch) -> Bytes {
-        let mut buf = Vec::new();
-        let mut writer =
-            parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
-        writer.write(batch).unwrap();
-        writer.close().unwrap();
-        Bytes::from(buf)
     }
 
     /// Writes a Paimon deletion-vector blob and returns the `DeletionFile` pointing at it.
@@ -3539,7 +3541,7 @@ mod tests {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let table_path = "memory:/file_index_skip";
         let bucket_path = format!("{table_path}/bucket-0");
-        let mut file = data_file("missing.mosaic", 1, 2, 0);
+        let mut file = data_file("missing.parquet", 1, 2, 0);
         file.embedded_index = Some(index.to_vec());
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
@@ -3596,10 +3598,10 @@ mod tests {
     async fn test_file_index_bitmap_selection_intersects_unordered_split_ranges_and_deletion_vector(
     ) {
         let fields = pk_fields();
-        let data = write_mosaic(&pk_batch(
+        let data = write_parquet_fixture(&[pk_batch(
             vec![1, 2, 3, 4, 5, 6],
             vec!["a", "b", "c", "d", "e", "f"],
-        ));
+        )]);
         let index = file_index_bytes(
             "memory:/file_index_selection_source",
             "id",
@@ -3619,7 +3621,7 @@ mod tests {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let table_path = "memory:/file_index_selection";
         let bucket_path = format!("{table_path}/bucket-0");
-        let file_name = "part-0.mosaic";
+        let file_name = "part-0.parquet";
         file_io
             .new_output(&format!("{bucket_path}/{file_name}"))
             .unwrap()
@@ -3723,11 +3725,11 @@ mod tests {
             .await
             .unwrap();
 
-        let data = write_mosaic(&pk_batch(vec![1], vec!["a"]));
+        let data = write_parquet_fixture(&[pk_batch(vec![1], vec!["a"])]);
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let table_path = "memory:/file_index_bloom";
         let bucket_path = format!("{table_path}/bucket-0");
-        let file_name = "part-0.mosaic";
+        let file_name = "part-0.parquet";
         file_io
             .new_output(&format!("{bucket_path}/{file_name}"))
             .unwrap()
@@ -3807,7 +3809,7 @@ mod tests {
             .write(Bytes::from(serde_json::to_vec(&old_schema).unwrap()))
             .await
             .unwrap();
-        let mut file = data_file("missing.mosaic", 1, 2, old_schema.id());
+        let mut file = data_file("missing.parquet", 1, 2, old_schema.id());
         file.embedded_index = Some(index.to_vec());
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
@@ -4045,7 +4047,7 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1, 2]))],
         )
         .unwrap();
-        let data = write_mosaic(&batch);
+        let data = write_parquet_fixture(&[batch]);
         let index = file_index_bytes(
             "memory:/file_index_nested_not_source",
             "id",
@@ -4059,7 +4061,7 @@ mod tests {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let table_path = "memory:/file_index_nested_not";
         let bucket_path = format!("{table_path}/bucket-0");
-        let file_name = "part-0.mosaic";
+        let file_name = "part-0.parquet";
         file_io
             .new_output(&format!("{bucket_path}/{file_name}"))
             .unwrap()
@@ -4118,6 +4120,7 @@ mod tests {
 
     /// Deletion vectors are applied format-agnostically by `DataFileReader`; verify a
     /// Mosaic file honors deleted rows end to end.
+    #[cfg(feature = "format-mosaic")]
     #[tokio::test]
     async fn test_mosaic_with_deletion_vector() {
         let fields = pk_fields();
@@ -4187,11 +4190,12 @@ mod tests {
     }
 
     /// A Mosaic file and a Parquet file in the same split must both be read and concatenated.
+    #[cfg(feature = "format-mosaic")]
     #[tokio::test]
     async fn test_mosaic_mixed_format_read() {
         let fields = pk_fields();
         let mosaic_data = write_mosaic(&pk_batch(vec![1, 2], vec!["a", "b"]));
-        let parquet_data = write_parquet(&pk_batch(vec![3, 4], vec!["c", "d"]));
+        let parquet_data = write_parquet_fixture(&[pk_batch(vec![3, 4], vec!["c", "d"])]);
 
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let table_path = "memory:/mosaic_mixed";
@@ -4255,6 +4259,7 @@ mod tests {
 
     /// Exact predicate filtering, deletion vectors and projection must compose correctly:
     /// the predicate selects `id = 10`, the DV deletes that row, and no rows remain.
+    #[cfg(feature = "format-mosaic")]
     #[tokio::test]
     async fn test_mosaic_predicate_dv_projection_combination() {
         let fields = pk_fields();

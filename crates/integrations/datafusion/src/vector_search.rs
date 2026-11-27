@@ -636,7 +636,7 @@ mod tests {
                 .option("row-tracking.enabled", "true")
                 .option("data-evolution.enabled", "true")
                 .option("global-index.enabled", "true")
-                .option("global-index.search-mode", "full")
+                .option("global-index.search-mode", "fast")
                 .build()
                 .unwrap();
             catalog

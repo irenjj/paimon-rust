@@ -250,6 +250,7 @@ fn append_metadata_columns(
 mod tests {
     use super::*;
     use crate::arrow::build_target_arrow_schema;
+    use crate::arrow::format::parquet::write_parquet_fixture;
     use crate::deletion_vector::DeletionVectorFactory;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
@@ -263,37 +264,9 @@ mod tests {
     use arrow_array::{Array, Float32Array, Int32Array, Int64Array, RecordBatch};
     use bytes::Bytes;
     use futures::TryStreamExt;
-    use paimon_mosaic_core::spec::COMPRESSION_NONE;
-    use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use roaring::RoaringBitmap;
     use std::collections::BTreeMap;
-    use std::io;
     use std::sync::Arc;
-
-    struct MemOutputFile {
-        data: Vec<u8>,
-    }
-
-    impl MemOutputFile {
-        fn new() -> Self {
-            Self { data: Vec::new() }
-        }
-    }
-
-    impl OutputFile for MemOutputFile {
-        fn write(&mut self, data: &[u8]) -> io::Result<()> {
-            self.data.extend_from_slice(data);
-            Ok(())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn pos(&self) -> u64 {
-            self.data.len() as u64
-        }
-    }
 
     fn id_field() -> DataField {
         DataField::new(0, "id".to_string(), DataType::Int(IntType::new()))
@@ -342,46 +315,6 @@ mod tests {
         }
     }
 
-    fn write_mosaic_single_group(batch: &RecordBatch) -> Bytes {
-        let out = MemOutputFile::new();
-        let mut writer = MosaicWriter::new(
-            out,
-            batch.schema().as_ref(),
-            WriterOptions {
-                compression: COMPRESSION_NONE,
-                num_buckets: 2,
-                row_group_max_size: u64::MAX,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        writer.write_batch(batch).unwrap();
-        writer.close().unwrap();
-        Bytes::from(writer.output().data.to_vec())
-    }
-
-    /// Writes one row group per batch, so the reader yields one Arrow batch per
-    /// input batch — used for the cross-batch alignment test.
-    fn write_mosaic_multi_group(batches: &[RecordBatch]) -> Bytes {
-        let out = MemOutputFile::new();
-        let mut writer = MosaicWriter::new(
-            out,
-            batches[0].schema().as_ref(),
-            WriterOptions {
-                compression: COMPRESSION_NONE,
-                num_buckets: 2,
-                row_group_max_size: 1,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        for batch in batches {
-            writer.write_batch(batch).unwrap();
-        }
-        writer.close().unwrap();
-        Bytes::from(writer.output().data.to_vec())
-    }
-
     async fn write_deletion_file(
         file_io: &crate::io::FileIO,
         path: &str,
@@ -415,7 +348,7 @@ mod tests {
         )
     }
 
-    /// Build a `DataFileReader` over an in-memory mosaic file plus the matching
+    /// Build a `DataFileReader` over an in-memory Parquet file plus the matching
     /// `DataSplit`, pinning the data file's `first_row_id = Some(0)`.
     /// `read_type`/`predicates` override the reader's projection and filter;
     /// `deleted_rows`, when non-empty, writes a DV into the split.
@@ -455,7 +388,7 @@ mod tests {
     ) -> (DataFileReader, DataSplit, Option<Arc<DeletionVector>>) {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let bucket_path = format!("{table_path}/bucket-0");
-        let file_name = "part-0.mosaic";
+        let file_name = "part-0.parquet";
         file_io
             .new_output(&format!("{bucket_path}/{file_name}"))
             .unwrap()
@@ -560,7 +493,7 @@ mod tests {
         // rows id=[10,11,12,13,14], first_row_id=0, select positions [0,2,4]
         // -> output ids [10,12,14], _PKEY_VECTOR_POSITION [0,2,4], ascending;
         // no _ROW_ID leak and no __paimon_search_score column.
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12, 13, 14]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11, 12, 13, 14])]);
         let (reader, split, _dv) = build_reader_and_split(
             "memory:/pkvpr_basic",
             &data,
@@ -606,7 +539,7 @@ mod tests {
     async fn test_score_alignment_non_contiguous() {
         // select [0,2,5] with scores {0:0.9, 2:0.5, 5:0.1}
         // -> __paimon_search_score aligned by returned position: [0.9,0.5,0.1].
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12, 13, 14, 15]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11, 12, 13, 14, 15])]);
         let (reader, split, _dv) = build_reader_and_split(
             "memory:/pkvpr_scores",
             &data,
@@ -645,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_score_omitted_no_score_column() {
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11, 12])]);
         let (reader, split, _dv) = build_reader_and_split(
             "memory:/pkvpr_noscore",
             &data,
@@ -680,7 +613,7 @@ mod tests {
         // select [0,1,2,3] scores {0:.4,1:.3,2:.2,3:.1}, DV deletes position 1.
         // -> returned positions [0,2,3], scores [.4,.2,.1]; position 1 absent.
         // scores STILL contains key 1 (input contract), though row 1 is deleted.
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12, 13]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11, 12, 13])]);
         let (reader, split, dv) =
             build_reader_and_split("memory:/pkvpr_dv", &data, 4, id_fields(), Vec::new(), &[1])
                 .await;
@@ -716,7 +649,7 @@ mod tests {
         // Three row groups [10,11] [12,13] [14,15] -> reader yields >1 batch.
         // Select [1,2,4] spanning batch boundaries; assert position/score
         // alignment holds across batches (row_id_offset advances correctly).
-        let data = write_mosaic_multi_group(&[
+        let data = write_parquet_fixture(&[
             id_batch(vec![10, 11]),
             id_batch(vec![12, 13]),
             id_batch(vec![14, 15]),
@@ -774,7 +707,7 @@ mod tests {
         // Candidates [1,3,4,5] with scores keyed by local position; DV deletes
         // position 2 (a NON-candidate) -> it must not perturb the surviving rows.
         // Expected surviving rows: ids [11,13,14,15], positions [1,3,4,5].
-        let data = write_mosaic_multi_group(&[
+        let data = write_parquet_fixture(&[
             id_batch(vec![10, 11]),
             id_batch(vec![12, 13]),
             id_batch(vec![14, 15]),
@@ -823,7 +756,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_positions_is_error() {
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11, 12])]);
         let (reader, split, _dv) = build_reader_and_split(
             "memory:/pkvpr_empty",
             &data,
@@ -853,7 +786,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_position_out_of_range_is_error() {
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11, 12])]);
         let (reader, split, _dv) =
             build_reader_and_split("memory:/pkvpr_oor", &data, 3, id_fields(), Vec::new(), &[])
                 .await;
@@ -875,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_negative_position_is_error() {
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11, 12])]);
         let (reader, split, _dv) =
             build_reader_and_split("memory:/pkvpr_neg", &data, 3, id_fields(), Vec::new(), &[])
                 .await;
@@ -899,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scores_key_mismatch_is_error() {
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11, 12])]);
         let (reader, split, _dv) = build_reader_and_split(
             "memory:/pkvpr_scoremismatch",
             &data,
@@ -949,7 +882,7 @@ mod tests {
             .with_bucket(0)
             .with_bucket_path("memory:/pkvpr_pred/bucket-0".to_string())
             .with_total_buckets(1)
-            .with_data_files(vec![data_file("part-0.mosaic", 1, 5, 1, Some(0))])
+            .with_data_files(vec![data_file("part-0.parquet", 1, 5, 1, Some(0))])
             .build()
             .unwrap();
 
@@ -996,7 +929,7 @@ mod tests {
             .with_bucket(0)
             .with_bucket_path("memory:/pkvpr_reserved/bucket-0".to_string())
             .with_total_buckets(1)
-            .with_data_files(vec![data_file("part-0.mosaic", 1, 5, 1, Some(0))])
+            .with_data_files(vec![data_file("part-0.parquet", 1, 5, 1, Some(0))])
             .build()
             .unwrap();
 
@@ -1044,7 +977,7 @@ mod tests {
             .with_bucket(0)
             .with_bucket_path("memory:/pkvpr_reqrowid/bucket-0".to_string())
             .with_total_buckets(1)
-            .with_data_files(vec![data_file("part-0.mosaic", 1, 5, 1, Some(0))])
+            .with_data_files(vec![data_file("part-0.parquet", 1, 5, 1, Some(0))])
             .build()
             .unwrap();
 

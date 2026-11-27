@@ -366,6 +366,7 @@ mod tests {
 mod e2e_tests {
     use super::*;
     use crate::arrow::build_target_arrow_schema;
+    use crate::arrow::format::parquet::write_parquet_fixture;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{DataField, DataFileMeta, DataType, IntType};
@@ -376,32 +377,8 @@ mod e2e_tests {
     use arrow_array::{Array, Float32Array, Int32Array, Int64Array, RecordBatch};
     use bytes::Bytes;
     use futures::TryStreamExt;
-    use paimon_mosaic_core::spec::COMPRESSION_NONE;
-    use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use roaring::RoaringBitmap;
-    use std::io;
     use std::sync::Arc;
-
-    struct MemOutputFile {
-        data: Vec<u8>,
-    }
-    impl MemOutputFile {
-        fn new() -> Self {
-            Self { data: Vec::new() }
-        }
-    }
-    impl OutputFile for MemOutputFile {
-        fn write(&mut self, data: &[u8]) -> io::Result<()> {
-            self.data.extend_from_slice(data);
-            Ok(())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-        fn pos(&self) -> u64 {
-            self.data.len() as u64
-        }
-    }
 
     fn id_field() -> DataField {
         DataField::new(0, "id".to_string(), DataType::Int(IntType::new()))
@@ -440,44 +417,6 @@ mod e2e_tests {
         }
     }
 
-    fn write_mosaic_single_group(batch: &RecordBatch) -> Bytes {
-        let out = MemOutputFile::new();
-        let mut writer = MosaicWriter::new(
-            out,
-            batch.schema().as_ref(),
-            WriterOptions {
-                compression: COMPRESSION_NONE,
-                num_buckets: 2,
-                row_group_max_size: u64::MAX,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        writer.write_batch(batch).unwrap();
-        writer.close().unwrap();
-        Bytes::from(writer.output().data.to_vec())
-    }
-
-    fn write_mosaic_multi_group(batches: &[RecordBatch]) -> Bytes {
-        let out = MemOutputFile::new();
-        let mut writer = MosaicWriter::new(
-            out,
-            batches[0].schema().as_ref(),
-            WriterOptions {
-                compression: COMPRESSION_NONE,
-                num_buckets: 2,
-                row_group_max_size: 1,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        for batch in batches {
-            writer.write_batch(batch).unwrap();
-        }
-        writer.close().unwrap();
-        Bytes::from(writer.output().data.to_vec())
-    }
-
     async fn write_deletion_file(
         file_io: &crate::io::FileIO,
         path: &str,
@@ -510,7 +449,7 @@ mod e2e_tests {
         )
     }
 
-    /// Build a predicate-free `DataFileReader` over an in-memory mosaic file plus
+    /// Build a predicate-free `DataFileReader` over an in-memory Parquet file plus
     /// the matching split. `deleted_rows`, when non-empty, writes a DV into the split.
     async fn build_reader_and_split(
         table_path: &str,
@@ -520,7 +459,7 @@ mod e2e_tests {
     ) -> (DataFileReader, DataSplit) {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let bucket_path = format!("{table_path}/bucket-0");
-        let file_name = "part-0.mosaic";
+        let file_name = "part-0.parquet";
         file_io
             .new_output(&format!("{bucket_path}/{file_name}"))
             .unwrap()
@@ -610,7 +549,7 @@ mod e2e_tests {
     async fn reads_ranges_with_position_column_no_scores() {
         // rows id=[10,11,12], ranges [0..=0, 2..=2] -> ids [10,12], positions [0,2];
         // no _ROW_ID leak, no __paimon_search_score.
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11, 12])]);
         let (reader, split) = build_reader_and_split("memory:/pkvisr_basic", &data, 3, &[]).await;
         let indexed = PkVectorIndexedSplit {
             split,
@@ -641,7 +580,7 @@ mod e2e_tests {
 
     #[tokio::test]
     async fn reads_ranges_with_aligned_scores() {
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12, 13]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11, 12, 13])]);
         let (reader, split) = build_reader_and_split("memory:/pkvisr_scores", &data, 4, &[]).await;
         let indexed = PkVectorIndexedSplit {
             split,
@@ -671,7 +610,7 @@ mod e2e_tests {
     async fn deletion_vector_drops_selected_position_and_its_score() {
         // select positions [0,1,2,3] via ranges, scores aligned; DV deletes position 1.
         // -> returned positions [0,2,3], scores [.4,.2,.1]; input scores still had key 1.
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12, 13]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11, 12, 13])]);
         let (reader, split) = build_reader_and_split("memory:/pkvisr_dv", &data, 4, &[1]).await;
         let indexed = PkVectorIndexedSplit {
             split,
@@ -701,7 +640,7 @@ mod e2e_tests {
     async fn alignment_holds_across_multiple_batches() {
         // Three row groups [10,11] [12,13] [14,15] -> reader yields >1 batch.
         // ranges [1..=2, 4..=4] span batch boundaries.
-        let data = write_mosaic_multi_group(&[
+        let data = write_parquet_fixture(&[
             id_batch(vec![10, 11]),
             id_batch(vec![12, 13]),
             id_batch(vec![14, 15]),
@@ -740,7 +679,7 @@ mod e2e_tests {
     #[tokio::test]
     async fn multi_file_split_errors_at_call_site() {
         // Eager validation: multi-file split errors from read(...) itself, not the stream.
-        let data = write_mosaic_single_group(&id_batch(vec![10, 11]));
+        let data = write_parquet_fixture(&[id_batch(vec![10, 11])]);
         let (reader, _split) =
             build_reader_and_split("memory:/pkvisr_multifile", &data, 2, &[]).await;
         let split = DataSplitBuilder::new()
@@ -750,8 +689,8 @@ mod e2e_tests {
             .with_bucket_path("memory:/pkvisr_multifile/bucket-0".to_string())
             .with_total_buckets(1)
             .with_data_files(vec![
-                data_file("part-0.mosaic", data.len() as i64, 2),
-                data_file("part-1.mosaic", data.len() as i64, 2),
+                data_file("part-0.parquet", data.len() as i64, 2),
+                data_file("part-1.parquet", data.len() as i64, 2),
             ])
             .build()
             .unwrap();

@@ -926,7 +926,9 @@ mod tests {
         for (path, expected) in [
             ("data.row", data_schema_fields.as_slice()),
             ("data.parquet", projected_fields),
+            #[cfg(feature = "format-orc")]
             ("data.orc", projected_fields),
+            #[cfg(feature = "format-mosaic")]
             ("data.mosaic", projected_fields),
         ] {
             let configured = create_format_reader_with_budget(
@@ -961,6 +963,7 @@ mod tests {
         let projected = vec![field(vec![child(2, "second")])];
         for path in [
             "data.parquet",
+            #[cfg(feature = "format-orc")]
             "data.orc",
             "data.avro",
             "data.json",
@@ -1037,28 +1040,31 @@ mod tests {
             );
             assert!(!io.exists(&path).await.unwrap());
         }
-        // A default layout still reaches the existing ORC type validation;
-        // it must not be rejected as an unsupported shredding configuration.
-        let options = HashMap::from([("fields.tags.map.storage-layout".into(), "default".into())]);
-        let output = io.new_output("memory:/ordinary-map/data.orc").unwrap();
-        let error = create_format_writer(
-            &output,
-            schema,
-            "none",
-            0,
-            None,
-            Some(&fields),
-            Some(&options),
-        )
-        .await
-        .err()
-        .expect("ORC's existing writer does not support MAP columns");
-        assert!(
-            error
-                .to_string()
-                .contains("ORC writer does not support column"),
-            "{error}"
-        );
+        #[cfg(feature = "format-orc")]
+        {
+            // A default layout still reaches the existing ORC type validation.
+            let options =
+                HashMap::from([("fields.tags.map.storage-layout".into(), "default".into())]);
+            let output = io.new_output("memory:/ordinary-map/data.orc").unwrap();
+            let error = create_format_writer(
+                &output,
+                schema,
+                "none",
+                0,
+                None,
+                Some(&fields),
+                Some(&options),
+            )
+            .await
+            .err()
+            .expect("ORC's existing writer does not support MAP columns");
+            assert!(
+                error
+                    .to_string()
+                    .contains("ORC writer does not support column"),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]

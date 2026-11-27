@@ -22,12 +22,12 @@ documentation = "https://docs.rs/paimon"
 name = "paimon"
 publish = ["crates-io"]
 
-homepage.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
-version.workspace = true
-rust-version.workspace = true
+homepage = "https://paimon.apache.org/docs/rust/"
+repository = "https://github.com/apache/paimon-rust"
+edition = "2021"
+license = "Apache-2.0"
+version = "0.6.0"
+rust-version = "1.95.0"
 
 [features]
 default = ["storage-memory", "storage-fs", "storage-oss"]
@@ -129,21 +129,21 @@ flate2 = "1"
 bzip2 = "0.6"
 liblzma = { version = "0.4", default-features = false, features = ["static"] }
 lzokay-native = { version = "0.1", default-features = false, features = ["compress", "decompress"] }
-arrow-array = { workspace = true }
-arrow-arith = { workspace = true }
-arrow-buffer = { workspace = true }
-arrow-cast = { workspace = true }
-arrow-json = { workspace = true }
-arrow-ipc = { workspace = true }
-arrow-ord = { workspace = true }
-arrow-row = { workspace = true }
-arrow-schema = { workspace = true }
-arrow-select = { workspace = true }
-arrow-string = { workspace = true }
+arrow-array = { version = "60.2.0", features = ["ffi"] }
+arrow-arith = "60.2.0"
+arrow-buffer = "60.2.0"
+arrow-cast = "60.2.0"
+arrow-json = "60.2.0"
+arrow-ipc = "60.2.0"
+arrow-ord = "60.2.0"
+arrow-row = "60.2.0"
+arrow-schema = "60.2.0"
+arrow-select = "60.2.0"
+arrow-string = "60.2.0"
 futures = "0.3"
 crossbeam-channel = "0.5"
-tokio-util = { workspace = true, features = ["compat", "io-util", "rt"] }
-parquet = { workspace = true, features = ["async", "zstd", "lz4", "snap"] }
+tokio-util = { version = "0.7", features = ["compat", "io-util", "rt"] }
+parquet = { version = "60.2.0", features = ["async", "zstd", "lz4", "snap"] }
 orc-rust = { version = "0.9.0", optional = true }
 async-stream = "0.3.6"
 reqwest = { version = "0.12", features = ["json", "gzip", "deflate"] }

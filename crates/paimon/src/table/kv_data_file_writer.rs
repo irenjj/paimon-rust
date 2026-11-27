@@ -752,13 +752,15 @@ mod tests {
         write_with_budget("parquet", "64mb", 32768, 1, 1024 * 1024, 1).await;
     }
 
+    #[cfg(any(feature = "format-mosaic", feature = "vortex"))]
     #[tokio::test]
     async fn formats_that_retain_rows_after_flush_keep_bounded_output_files() {
-        #[cfg(feature = "vortex")]
-        let formats = ["mosaic", "vortex"];
-        #[cfg(not(feature = "vortex"))]
-        let formats = ["mosaic"];
-        for format in formats {
+        for format in [
+            #[cfg(feature = "format-mosaic")]
+            "mosaic",
+            #[cfg(feature = "vortex")]
+            "vortex",
+        ] {
             write_with_budget(format, "8kb", 1024, 8, 64 * 1024, 8).await;
         }
     }

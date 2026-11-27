@@ -17,6 +17,7 @@
 
 use super::*;
 use crate::arrow::build_target_arrow_schema;
+use crate::arrow::format::parquet::write_parquet_fixture;
 use crate::arrow::format::FilePredicates;
 use crate::io::FileIOBuilder;
 use crate::spec::stats::BinaryTableStats;
@@ -30,28 +31,7 @@ use crate::table::schema_manager::SchemaManager;
 use crate::table::source::{DataSplit, DataSplitBuilder};
 use crate::table::vector_search_common::take_only_result;
 use arrow_array::{Int32Array, RecordBatch};
-use bytes::Bytes;
-use paimon_mosaic_core::spec::COMPRESSION_NONE;
-use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
-use std::io;
 use std::sync::Arc;
-
-struct MemOutputFile {
-    data: Vec<u8>,
-}
-
-impl OutputFile for MemOutputFile {
-    fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        self.data.extend_from_slice(data);
-        Ok(())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-    fn pos(&self) -> u64 {
-        self.data.len() as u64
-    }
-}
 
 fn id_field() -> DataField {
     DataField::new(0, "id".to_string(), DataType::Int(IntType::new()))
@@ -68,23 +48,6 @@ fn row_id_field() -> DataField {
 fn id_batch(ids: Vec<i32>) -> RecordBatch {
     let schema = build_target_arrow_schema(&[id_field()]).unwrap();
     RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))]).unwrap()
-}
-
-fn write_mosaic(batch: &RecordBatch) -> Bytes {
-    let mut writer = MosaicWriter::new(
-        MemOutputFile { data: Vec::new() },
-        batch.schema().as_ref(),
-        WriterOptions {
-            compression: COMPRESSION_NONE,
-            num_buckets: 2,
-            row_group_max_size: u64::MAX,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    writer.write_batch(batch).unwrap();
-    writer.close().unwrap();
-    Bytes::from(writer.output().data.to_vec())
 }
 
 fn data_file(
@@ -119,7 +82,7 @@ fn data_file(
 }
 
 /// Build a predicate-free reader (read_type = `id` + `_ROW_ID`) over a split
-/// containing `files` (each `(name, ids, first_row_id)`), written as Mosaic
+/// containing `files` (each `(name, ids, first_row_id)`), written as Parquet
 /// data files in the same bucket. The returned active-file list covers every
 /// file (all files active).
 async fn build_reader_and_split(
@@ -131,7 +94,7 @@ async fn build_reader_and_split(
     let mut metas = Vec::new();
     let mut active_files = Vec::new();
     for (name, ids, first_row_id) in files {
-        let data = write_mosaic(&id_batch(ids.clone()));
+        let data = write_parquet_fixture(&[id_batch(ids.clone())]);
         file_io
             .new_output(&format!("{bucket_path}/{name}"))
             .unwrap()
@@ -193,14 +156,14 @@ fn sorted(ranges: &[RowRange]) -> Vec<u64> {
 async fn residual_ranges_coalesce_matches_without_bridging_gaps() {
     let (reader, split, active) = build_reader_and_split(
         "memory:/residual_range_gaps",
-        &[("part-0.mosaic", vec![7, 7, 0, 7, 7, 0, 7], 100)],
+        &[("part-0.parquet", vec![7, 7, 0, 7, 7, 0, 7], 100)],
     )
     .await;
     let ranges = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(0), None)
         .await
         .unwrap();
     assert_eq!(
-        ranges["part-0.mosaic"],
+        ranges["part-0.parquet"],
         vec![
             RowRange::new(0, 1),
             RowRange::new(3, 4),
@@ -209,7 +172,7 @@ async fn residual_ranges_coalesce_matches_without_bridging_gaps() {
     );
 
     let allowed = HashMap::from([(
-        "part-0.mosaic".to_string(),
+        "part-0.parquet".to_string(),
         vec![RowRange::new(1, 3), RowRange::new(5, 6)],
     )]);
     let ranges =
@@ -217,7 +180,7 @@ async fn residual_ranges_coalesce_matches_without_bridging_gaps() {
             .await
             .unwrap();
     assert_eq!(
-        ranges["part-0.mosaic"],
+        ranges["part-0.parquet"],
         vec![
             RowRange::new(1, 1),
             RowRange::new(3, 3),
@@ -231,13 +194,13 @@ async fn test_residual_selects_matching_positions() {
     // ids [1,2,3,4,5] at first_row_id 0; id > 2 -> ids 3,4,5 -> positions 2,3,4.
     let (reader, split, active) = build_reader_and_split(
         "memory:/rpf_basic",
-        &[("part-0.mosaic", vec![1, 2, 3, 4, 5], 0)],
+        &[("part-0.parquet", vec![1, 2, 3, 4, 5], 0)],
     )
     .await;
     let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(2), None)
         .await
         .unwrap();
-    assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
+    assert_eq!(sorted(&map["part-0.parquet"]), vec![2, 3, 4]);
 }
 
 #[tokio::test]
@@ -251,15 +214,15 @@ async fn test_residual_only_evaluates_the_rows_the_plan_allows() {
     // selection dry and fail loudly rather than return a filtered answer.
     let (reader, split, active) = build_reader_and_split(
         "memory:/rpf_plan_ranges",
-        &[("part-0.mosaic", vec![1, 2, 3, 4, 5], 0)],
+        &[("part-0.parquet", vec![1, 2, 3, 4, 5], 0)],
     )
     .await;
-    let allowed = HashMap::from([("part-0.mosaic".to_string(), vec![RowRange::new(3, 4)])]);
+    let allowed = HashMap::from([("part-0.parquet".to_string(), vec![RowRange::new(3, 4)])]);
     let map =
         residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(2), Some(&allowed))
             .await
             .unwrap();
-    assert_eq!(sorted(&map["part-0.mosaic"]), vec![3, 4]);
+    assert_eq!(sorted(&map["part-0.parquet"]), vec![3, 4]);
 }
 
 #[tokio::test]
@@ -269,11 +232,11 @@ async fn test_residual_does_not_read_a_file_the_plan_excludes() {
     // narrowed nothing there -- so the residual reads the whole file.
     let (reader, split, active) = build_reader_and_split(
         "memory:/rpf_plan_excludes",
-        &[("part-0.mosaic", vec![1, 2, 3], 0)],
+        &[("part-0.parquet", vec![1, 2, 3], 0)],
     )
     .await;
 
-    let excluded = HashMap::from([("part-0.mosaic".to_string(), Vec::new())]);
+    let excluded = HashMap::from([("part-0.parquet".to_string(), Vec::new())]);
     let map = residual_row_ranges_by_file(
         &reader,
         &split,
@@ -283,8 +246,8 @@ async fn test_residual_does_not_read_a_file_the_plan_excludes() {
     )
     .await
     .unwrap();
-    assert!(map.contains_key("part-0.mosaic"));
-    assert!(sorted(&map["part-0.mosaic"]).is_empty());
+    assert!(map.contains_key("part-0.parquet"));
+    assert!(sorted(&map["part-0.parquet"]).is_empty());
 
     let unrestricted = HashMap::new();
     let map = residual_row_ranges_by_file(
@@ -296,29 +259,29 @@ async fn test_residual_does_not_read_a_file_the_plan_excludes() {
     )
     .await
     .unwrap();
-    assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
+    assert_eq!(sorted(&map["part-0.parquet"]), vec![0, 1, 2]);
 }
 
 #[tokio::test]
 async fn test_residual_matches_none_yields_empty_entry() {
     // id > 100 matches nothing; the file still gets a (present, empty) entry.
     let (reader, split, active) =
-        build_reader_and_split("memory:/rpf_none", &[("part-0.mosaic", vec![1, 2, 3], 0)]).await;
+        build_reader_and_split("memory:/rpf_none", &[("part-0.parquet", vec![1, 2, 3], 0)]).await;
     let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(100), None)
         .await
         .unwrap();
-    assert!(map.contains_key("part-0.mosaic"));
-    assert!(map["part-0.mosaic"].is_empty());
+    assert!(map.contains_key("part-0.parquet"));
+    assert!(map["part-0.parquet"].is_empty());
 }
 
 #[tokio::test]
 async fn test_residual_matches_all_yields_full_set() {
     let (reader, split, active) =
-        build_reader_and_split("memory:/rpf_all", &[("part-0.mosaic", vec![1, 2, 3], 0)]).await;
+        build_reader_and_split("memory:/rpf_all", &[("part-0.parquet", vec![1, 2, 3], 0)]).await;
     let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(0), None)
         .await
         .unwrap();
-    assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
+    assert_eq!(sorted(&map["part-0.parquet"]), vec![0, 1, 2]);
 }
 
 #[tokio::test]
@@ -328,44 +291,44 @@ async fn test_residual_positions_are_file_local_across_files() {
     let (reader, split, active) = build_reader_and_split(
         "memory:/rpf_multi",
         &[
-            ("part-0.mosaic", vec![1, 2, 3, 4, 5], 0),
-            ("part-1.mosaic", vec![1, 2, 3, 4, 5], 100),
+            ("part-0.parquet", vec![1, 2, 3, 4, 5], 0),
+            ("part-1.parquet", vec![1, 2, 3, 4, 5], 100),
         ],
     )
     .await;
     let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(3), None)
         .await
         .unwrap();
-    assert_eq!(sorted(&map["part-0.mosaic"]), vec![3, 4]);
-    assert_eq!(sorted(&map["part-1.mosaic"]), vec![3, 4]);
+    assert_eq!(sorted(&map["part-0.parquet"]), vec![3, 4]);
+    assert_eq!(sorted(&map["part-1.parquet"]), vec![3, 4]);
 }
 
 #[tokio::test]
 async fn test_non_active_files_are_skipped() {
-    // Two files in the split, but only `part-0.mosaic` is active. The bucket
-    // search never recalls from `part-1.mosaic` (level-0 / non-active), so it
+    // Two files in the split, but only `part-0.parquet` is active. The bucket
+    // search never recalls from `part-1.parquet` (level-0 / non-active), so it
     // must not appear in the residual map — and even though it lacks a
     // `first_row_id`, the query still succeeds because non-active files are
     // skipped before the guard.
     let (reader, split, mut active) = build_reader_and_split(
         "memory:/rpf_nonactive",
-        &[("part-0.mosaic", vec![1, 2, 3, 4, 5], 0)],
+        &[("part-0.parquet", vec![1, 2, 3, 4, 5], 0)],
     )
     .await;
     // Append a non-active file (missing first_row_id) directly to the split's
     // data files, but leave it out of the active list.
     let file_io = FileIOBuilder::new("memory").build().unwrap();
     let bucket_path = "memory:/rpf_nonactive/bucket-0";
-    let data = write_mosaic(&id_batch(vec![9, 9, 9]));
+    let data = write_parquet_fixture(&[id_batch(vec![9, 9, 9])]);
     file_io
-        .new_output(&format!("{bucket_path}/part-1.mosaic"))
+        .new_output(&format!("{bucket_path}/part-1.parquet"))
         .unwrap()
         .write(data.clone())
         .await
         .unwrap();
     let mut metas = split.data_files().to_vec();
-    metas.push(data_file("part-1.mosaic", data.len() as i64, 3, None));
-    // `active` already lists only part-0.mosaic; keep it that way.
+    metas.push(data_file("part-1.parquet", data.len() as i64, 3, None));
+    // `active` already lists only part-0.parquet; keep it that way.
     let _ = &mut active;
     let split = DataSplitBuilder::new()
         .with_snapshot(1)
@@ -379,9 +342,9 @@ async fn test_non_active_files_are_skipped() {
     let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(2), None)
         .await
         .unwrap();
-    assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
+    assert_eq!(sorted(&map["part-0.parquet"]), vec![2, 3, 4]);
     assert!(
-        !map.contains_key("part-1.mosaic"),
+        !map.contains_key("part-1.parquet"),
         "non-active file must be skipped"
     );
 }
@@ -395,7 +358,7 @@ async fn test_missing_first_row_id_recovers_local_positions() {
     let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(0), None)
         .await
         .expect("missing first_row_id must not fail the residual read");
-    assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
+    assert_eq!(sorted(&map["part-0.parquet"]), vec![0, 1, 2]);
 }
 
 async fn build_reader_and_split_no_first_row_id(
@@ -403,9 +366,9 @@ async fn build_reader_and_split_no_first_row_id(
     let table_path = "memory:/rpf_nofrid";
     let file_io = FileIOBuilder::new("memory").build().unwrap();
     let bucket_path = format!("{table_path}/bucket-0");
-    let data = write_mosaic(&id_batch(vec![1, 2, 3]));
+    let data = write_parquet_fixture(&[id_batch(vec![1, 2, 3])]);
     file_io
-        .new_output(&format!("{bucket_path}/part-0.mosaic"))
+        .new_output(&format!("{bucket_path}/part-0.parquet"))
         .unwrap()
         .write(data.clone())
         .await
@@ -416,7 +379,12 @@ async fn build_reader_and_split_no_first_row_id(
         .with_bucket(0)
         .with_bucket_path(bucket_path)
         .with_total_buckets(1)
-        .with_data_files(vec![data_file("part-0.mosaic", data.len() as i64, 3, None)])
+        .with_data_files(vec![data_file(
+            "part-0.parquet",
+            data.len() as i64,
+            3,
+            None,
+        )])
         .build()
         .unwrap();
     let reader = DataFileReader::new(
@@ -431,7 +399,7 @@ async fn build_reader_and_split_no_first_row_id(
     // The lone file is active and carries no first_row_id, exercising the
     // ordinal-based position recovery.
     let active = vec![BucketActiveFile {
-        file_name: "part-0.mosaic".to_string(),
+        file_name: "part-0.parquet".to_string(),
         row_count: 3,
     }];
     (reader, split, active)
