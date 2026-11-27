@@ -59,11 +59,15 @@ use paimon::spec::{
 use paimon::table::{ArrowRecordBatchStream, ScanStats, Table, TableRead};
 use paimon::DataSplit;
 
+#[cfg(not(feature = "dml"))]
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+#[cfg(not(feature = "dml"))]
 use paimon::resource::{MemoryPool, ResourceContext};
 
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::{is_float_zero, scalar_to_datum};
+#[cfg(feature = "dml")]
+use crate::memory::reader_resources;
 
 fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
@@ -1167,11 +1171,13 @@ impl PaimonTableScan {
     }
 }
 
+#[cfg(not(feature = "dml"))]
 #[derive(Debug)]
 struct DataFusionMemoryPool {
     reservation: MemoryReservation,
 }
 
+#[cfg(not(feature = "dml"))]
 impl MemoryPool for DataFusionMemoryPool {
     fn try_reserve(&self, bytes: usize) -> paimon::Result<()> {
         self.reservation
@@ -1186,12 +1192,14 @@ impl MemoryPool for DataFusionMemoryPool {
     }
 }
 
+#[cfg(not(feature = "dml"))]
 fn reader_resources(context: &TaskContext, partition: usize) -> paimon::Result<ResourceContext> {
     // Register per execution, not on the reusable plan. Reader working state
     // cannot spill; downstream operators account for batches they retain.
     resources(context, format!("PaimonTableScan[{partition}]"))
 }
 
+#[cfg(not(feature = "dml"))]
 fn resources(
     context: &TaskContext,
     consumer: impl Into<String>,
@@ -2986,9 +2994,22 @@ mod tests {
 
     #[tokio::test]
     async fn scan_memory_honors_each_execution_pool() {
+        let (_dir, scan, estimate) = memory_scan_fixture();
+        assert_scan_memory_honors_pool(&scan, estimate).await;
+    }
+
+    #[cfg(all(test, feature = "dml"))]
+    #[tokio::test]
+    async fn audit_scan_memory_honors_each_execution_pool() {
+        let (_dir, scan, estimate) = memory_scan_fixture();
+        let plan = super::super::audit_log::PaimonAuditLogScan::new(scan);
+        assert_scan_memory_honors_pool(&plan, estimate).await;
+    }
+
+    async fn assert_scan_memory_honors_pool(plan: &dyn ExecutionPlan, estimate: usize) {
         use datafusion_common::DataFusionError;
         use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-        let (_dir, plan, estimate) = memory_scan_fixture();
+
         let rejected = Arc::new(GreedyMemoryPool::new(0));
         let ctx = memory_session(rejected.clone());
         let mut stream = plan.execute(0, Arc::clone(&ctx)).unwrap();

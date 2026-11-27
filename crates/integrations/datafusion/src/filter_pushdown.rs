@@ -327,6 +327,28 @@ impl<'a> FilterTranslator<'a> {
     }
 
     fn translate_scalar_function(&self, func: &ScalarFunction) -> Option<TranslatedPredicate> {
+        #[cfg(feature = "dml")]
+        if func.func.inner().is::<crate::geospatial::BBoxIntersects>() {
+            let [column, xmin, ymin, xmax, ymax] = func.args.as_slice() else {
+                return None;
+            };
+            let field = self.resolve_field(column)?;
+            let coordinate = |expr: &Expr| match extract_scalar_literal(expr)? {
+                ScalarValue::Float64(Some(value)) => Some(*value),
+                _ => None,
+            };
+            return self.exact(
+                self.predicate_builder
+                    .bbox_intersects(
+                        field.name(),
+                        coordinate(xmin)?,
+                        coordinate(ymin)?,
+                        coordinate(xmax)?,
+                        coordinate(ymax)?,
+                    )
+                    .ok()?,
+            );
+        }
         if matches!(
             func.name(),
             "array_has"
@@ -1150,6 +1172,111 @@ mod tests {
             build_pushed_predicate(&[array_has(widened_floats, lit(1.1_f64))], &float_fields)
                 .is_none()
         );
+    }
+
+    #[cfg(all(test, feature = "dml"))]
+    #[tokio::test]
+    async fn test_translate_array_membership_after_datafusion_sql_analysis() {
+        use datafusion::arrow::datatypes::{
+            DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+        };
+        use datafusion::datasource::empty::EmptyTable;
+        use datafusion::logical_expr::LogicalPlan;
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        fn filter_expr(plan: &LogicalPlan) -> Option<&Expr> {
+            match plan {
+                LogicalPlan::Filter(filter) => Some(&filter.predicate),
+                LogicalPlan::TableScan(scan) => scan.filters.first(),
+                other => other.inputs().into_iter().find_map(filter_expr),
+            }
+        }
+
+        let ctx = SessionContext::new();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "items",
+            ArrowDataType::new_list(ArrowDataType::Int32, true),
+            true,
+        )]));
+        ctx.register_table("t", Arc::new(EmptyTable::new(arrow_schema)))
+            .unwrap();
+        let fields = vec![DataField::new(
+            1,
+            "items".to_string(),
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+        )];
+        let cases = [
+            (
+                "SELECT * FROM t WHERE array_has(items, 2)",
+                PredicateOperator::ArrayContains,
+                vec![Datum::Int(2)],
+            ),
+            (
+                "SELECT * FROM t WHERE array_has_any(items, [1, 3])",
+                PredicateOperator::ArraysOverlap,
+                vec![Datum::Int(1), Datum::Int(3)],
+            ),
+            (
+                "SELECT * FROM t WHERE array_has_all(items, [1, 3])",
+                PredicateOperator::ArrayContainsAll,
+                vec![Datum::Int(1), Datum::Int(3)],
+            ),
+        ];
+        for (sql, expected_op, expected_literals) in cases {
+            let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+            let plan = ctx.state().optimize(&plan).unwrap();
+            let filter = filter_expr(&plan).expect("optimized plan should retain the filter");
+            assert!(filter.to_string().contains("CAST"));
+
+            let predicate = build_pushed_predicate(std::slice::from_ref(filter), &fields)
+                .expect("analyzed SQL array predicate should translate");
+            assert!(matches!(
+                predicate,
+                Predicate::Leaf { op, literals, .. }
+                    if op == expected_op && literals == expected_literals
+            ));
+        }
+
+        let numeric_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "small_items",
+                ArrowDataType::new_list(ArrowDataType::Int16, true),
+                true,
+            ),
+            ArrowField::new(
+                "float_items",
+                ArrowDataType::new_list(ArrowDataType::Float32, true),
+                true,
+            ),
+        ]));
+        ctx.register_table("numeric_arrays", Arc::new(EmptyTable::new(numeric_schema)))
+            .unwrap();
+        let numeric_fields = vec![
+            DataField::new(
+                1,
+                "small_items".to_string(),
+                DataType::Array(ArrayType::new(DataType::SmallInt(SmallIntType::new()))),
+            ),
+            DataField::new(
+                2,
+                "float_items".to_string(),
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            ),
+        ];
+        for sql in [
+            "SELECT * FROM numeric_arrays WHERE array_has(small_items, 2)",
+            "SELECT * FROM numeric_arrays WHERE array_has(float_items, 1.0)",
+        ] {
+            let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+            let plan = ctx.state().optimize(&plan).unwrap();
+            let filter = filter_expr(&plan).expect("optimized plan should retain the filter");
+            assert!(filter.to_string().contains("CAST"));
+            assert!(
+                build_pushed_predicate(std::slice::from_ref(filter), &numeric_fields).is_some(),
+                "analyzed numeric ARRAY predicate should translate: {filter}"
+            );
+        }
     }
 
     #[test]

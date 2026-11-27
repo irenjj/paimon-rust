@@ -4,7 +4,7 @@
 upstream_repo: https://github.com/apache/paimon-rust.git
 upstream_sha: ebcff9f1279233d3afe47c466530acfb6e07158c
 upstream_version: 0.6.0
-target_datafusion_sha: 0ddfccd0ee54565ad66484f1c9b86fdacbd790a8
+target_datafusion_sha: 9f21b10e76b13f35c379376d09d51fbc5e8581f3
 target_datafusion_version: 57.0.0-dev
 ```
 
@@ -42,11 +42,17 @@ blob_reader.rs
 vector_type.rs
 ```
 
-The removed modules covered SQLContext, DDL/DML, Spark compatibility,
-stored procedures, read_files, system and object tables, external table engine
-dispatch, persistent view planning and lateral vector search. Scan range
-partitioning and execution memory accounting live in the retained physical plan
-files.
+All upstream source files are retained. SQLContext, DDL/DML, Spark
+compatibility, stored procedures, `read_files`, system and object tables,
+external table engine dispatch, persistent view planning and lateral vector
+search are gated behind the default-off `dml` feature. The 63 files restored
+from upstream are byte-for-byte identical to the baseline. The default build
+uses the modular range partitioning and execution memory accounting in the
+physical plan files.
+
+The gate preserves upstream code for rebases and future write support.
+Enabling `dml` requires a separate migration of the legacy DataFusion APIs
+and dependencies to the pinned modular build.
 
 ## Local patches
 
@@ -92,7 +98,7 @@ workspace that consumes `paimon-datafusion`.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 export DF_ROOT=/path/to/datafusion
-test "$(git -C "$DF_ROOT" rev-parse HEAD)" = 0ddfccd0ee54565ad66484f1c9b86fdacbd790a8
+test "$(git -C "$DF_ROOT" rev-parse HEAD)" = 9f21b10e76b13f35c379376d09d51fbc5e8581f3
 test -z "$(git -C "$DF_ROOT" status --porcelain)"
 unset PAIMON_TEST_WAREHOUSE
 
@@ -113,9 +119,10 @@ cargo test --locked "${df_patch[@]}" -p paimon-datafusion --lib
 bash crates/integrations/datafusion/check-readonly-dependencies.sh "${df_patch[@]}"
 ```
 
-Cargo records the patched packages in the root `Cargo.lock` without their
-checkout paths. The core lockfile resolves independently and needs no patches.
-The Git push URL is `no-push-upstream`.
+The root `Cargo.lock` resolves with `--locked` against the pinned DataFusion
+checkout. Cargo records the patched packages without their checkout paths.
+The core lockfile resolves independently and needs no patches. The Git push
+URL is `no-push-upstream`.
 
 ## Validation
 

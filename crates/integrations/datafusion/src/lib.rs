@@ -17,19 +17,94 @@
 
 //! Read-only Apache Paimon providers and functions for DataFusion.
 
+#[cfg(feature = "dml")]
+mod approx_percentile;
+#[cfg(feature = "dml")]
+mod binary_cast;
 mod blob_descriptor_functions;
 mod blob_reader;
 mod blob_view;
 mod catalog;
+#[cfg(feature = "dml")]
+mod compat_functions;
+#[cfg(feature = "dml")]
+mod delete;
 mod error;
+#[cfg(feature = "dml")]
+mod expression_compat;
+#[cfg(feature = "dml")]
+mod extended_describe;
 mod filter_pushdown;
+#[cfg(feature = "dml")]
+mod format_partition_analyze;
+#[cfg(feature = "dml")]
+mod format_partition_ddl;
+#[cfg(feature = "dml")]
+mod format_partition_repair;
+#[cfg(feature = "dml")]
+mod format_table_truncate;
 mod full_text_search;
+#[cfg(feature = "dml")]
+mod geospatial;
+#[cfg(test)]
+#[path = "../testdata/warehouse/mod.rs"]
+mod golden_warehouse;
 mod hybrid_search;
+#[cfg(feature = "dml")]
+mod json_functions;
+#[cfg(feature = "dml")]
+mod json_output;
+#[cfg(feature = "dml")]
+mod lateral_vector_search;
+#[cfg(feature = "dml")]
+mod lateral_views;
+#[cfg(feature = "dml")]
+mod memory;
+#[cfg(feature = "dml")]
+mod merge_condition;
+#[cfg(feature = "dml")]
+mod merge_into;
+#[cfg(feature = "dml")]
+mod partition_count_pushdown;
+#[cfg(feature = "dml")]
+mod partition_functions;
 mod physical_plan;
+#[cfg(feature = "dml")]
+mod primary_key_dml;
+#[cfg(feature = "dml")]
+mod procedures;
+#[cfg(feature = "dml")]
+mod read_files;
+#[cfg(feature = "dml")]
+mod regex_operators;
+#[cfg(feature = "dml")]
+mod relation_planner;
 pub mod runtime;
+#[cfg(feature = "dml")]
+mod scalar_compat;
+#[cfg(feature = "dml")]
+mod scalar_extra;
+#[cfg(feature = "dml")]
+mod selection_aggregate;
+#[cfg(feature = "dml")]
+mod show_metadata;
+#[cfg(feature = "dml")]
+mod spark_functions;
+#[cfg(feature = "dml")]
+mod sql_context;
+#[cfg(feature = "dml")]
+mod sql_function;
+#[cfg(feature = "dml")]
+mod system_tables;
 mod table;
 mod table_function_args;
 mod table_loader;
+#[cfg(feature = "dml")]
+mod update;
+#[cfg(feature = "dml")]
+mod variant_functions;
+#[cfg(feature = "dml")]
+mod variant_pushdown;
 mod vector_search;
 mod vector_type;
 
@@ -51,9 +126,26 @@ pub use table::PaimonTableProvider;
 pub use vector_search::VectorSearchFunction;
 pub use vector_type::{parse_expr, parse_sql, PaimonTypePlanner};
 
-#[cfg(test)]
-#[path = "../testdata/warehouse/mod.rs"]
-mod golden_warehouse;
+#[cfg(feature = "dml")]
+pub use blob_view::register_blob_view;
+#[cfg(feature = "dml")]
+pub use catalog::{register_catalog_table_engine, EngineTableRequest, TableEngineResolver};
+#[cfg(feature = "dml")]
+pub use full_text_search::register_full_text_search;
+#[cfg(feature = "dml")]
+pub use hybrid_search::register_hybrid_search;
+#[cfg(feature = "dml")]
+pub use merge_condition::compile_merge_condition;
+#[cfg(feature = "dml")]
+pub use procedures::execute_procedure;
+#[cfg(feature = "dml")]
+pub use relation_planner::PaimonRelationPlanner;
+#[cfg(feature = "dml")]
+pub use sql_context::{SQLContext, SQLContextBuilder};
+#[cfg(feature = "dml")]
+pub use variant_functions::register_variant_functions;
+#[cfg(feature = "dml")]
+pub use vector_search::register_vector_search;
 
 #[cfg(test)]
 mod test_session {

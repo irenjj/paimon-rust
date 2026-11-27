@@ -1,0 +1,292 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! DELETE execution for Paimon tables.
+//!
+//! Supports primary-key tombstones, append copy-on-write, and Data Evolution deletion vectors.
+
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::sql::sqlparser::ast::{Delete, FromTable, TableFactor};
+
+use paimon::spec::{CoreOptions, RowKind};
+use paimon::table::{CopyOnWriteMergeWriter, Table};
+
+use crate::error::to_datafusion_error;
+use crate::merge_into::TempTableTracker;
+use crate::merge_into::{
+    build_dml_selection_clause, build_partition_set_from_where, dml_table_alias,
+    extract_tracking_columns, is_delete_conflict, is_row_id_conflict, ok_result,
+    register_cow_target_table, retry_on_conflict,
+};
+use crate::primary_key_dml;
+use crate::sql_context::SQLContext;
+
+/// Execute a DELETE statement on a Paimon table.
+///
+/// `table_ref` is the SQL table reference string (e.g. `"paimon.test_db.t"`),
+/// already extracted by the caller for catalog resolution.
+pub(crate) async fn execute_delete(
+    ctx: &SQLContext,
+    delete: &Delete,
+    table: Table,
+    table_ref: &str,
+) -> DFResult<DataFrame> {
+    let tables = match &delete.from {
+        FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+    };
+    let [target] = tables.as_slice() else {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE requires a single target table".into(),
+        ));
+    };
+    if !delete.tables.is_empty() {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE with an explicit target table list is not supported".into(),
+        ));
+    }
+    if delete.using.is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE ... USING is not supported".into(),
+        ));
+    }
+    if !target.joins.is_empty() {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE ... JOIN is not supported".into(),
+        ));
+    }
+    if let TableFactor::Table { alias: Some(a), .. } = &target.relation {
+        return Err(DataFusionError::Plan(format!(
+            "Table alias '{}' in DELETE is not yet supported",
+            a.name.value
+        )));
+    }
+    if matches!(&target.relation, TableFactor::Table { args: Some(_), .. }) {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE on table functions is not supported".into(),
+        ));
+    }
+    if matches!(&target.relation, TableFactor::Table { sample, partitions, .. }
+        if sample.is_some() || !partitions.is_empty())
+    {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE with TABLESAMPLE or PARTITION is not supported".into(),
+        ));
+    }
+
+    let schema = table.schema();
+    let core_options = CoreOptions::new(schema.options());
+
+    if core_options.data_evolution_enabled() {
+        return execute_data_evolution_delete(ctx, delete, &table, table_ref).await;
+    }
+    if !schema.trimmed_primary_keys().is_empty() {
+        return execute_primary_key_delete(ctx, delete, &target.relation, &table, table_ref).await;
+    }
+
+    execute_cow_delete(ctx, delete, &table, table_ref).await
+}
+
+async fn execute_primary_key_delete(
+    ctx: &SQLContext,
+    delete: &Delete,
+    target: &TableFactor,
+    table: &Table,
+    table_ref: &str,
+) -> DFResult<DataFrame> {
+    primary_key_dml::validate_table(table, "DELETE")?;
+    if table.schema().core_options().ignore_delete() {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE on primary-key tables requires ignore-delete=false".into(),
+        ));
+    }
+    if delete.returning.is_some()
+        || delete.output.is_some()
+        || !delete.order_by.is_empty()
+        || delete.limit.is_some()
+        || !matches!(target,
+            TableFactor::Table {
+                version: None, with_ordinality: false,
+                json_path: None, with_hints, index_hints, ..
+            } if with_hints.is_empty() && index_hints.is_empty())
+    {
+        return Err(DataFusionError::NotImplemented(
+            "Primary-key DELETE supports a single target with an optional WHERE clause".into(),
+        ));
+    }
+
+    let input = primary_key_dml::plan_input(
+        ctx,
+        table,
+        table_ref,
+        "*",
+        delete.selection.as_ref(),
+        "DELETE",
+    )
+    .await?;
+    primary_key_dml::write_rows(ctx, table, input, RowKind::Delete, "DELETE").await
+}
+
+/// Execute DELETE on a data-evolution table with retry on row ID conflict.
+async fn execute_data_evolution_delete(
+    ctx: &SQLContext,
+    delete: &Delete,
+    table: &Table,
+    table_ref: &str,
+) -> DFResult<DataFrame> {
+    retry_on_conflict("Data-evolution DELETE", is_row_id_conflict, || {
+        execute_data_evolution_delete_once(ctx, delete, table, table_ref)
+    })
+    .await
+}
+
+/// Single attempt of data-evolution DELETE execution.
+async fn execute_data_evolution_delete_once(
+    ctx: &SQLContext,
+    delete: &Delete,
+    table: &Table,
+    table_ref: &str,
+) -> DFResult<DataFrame> {
+    let wb = table.new_write_builder();
+    let mut writer = wb.new_delete().map_err(to_datafusion_error)?;
+
+    let selection_clause = build_dml_selection_clause(
+        delete.selection.as_ref(),
+        &delete.order_by,
+        delete.limit.as_ref(),
+    );
+    let query_sql = format!("SELECT \"_ROW_ID\" FROM {table_ref}{selection_clause}");
+    let batches = ctx.ctx().sql(&query_sql).await?.collect().await?;
+
+    let total_count: u64 = batches.iter().map(|batch| batch.num_rows() as u64).sum();
+    if total_count == 0 {
+        return ok_result(ctx.ctx(), 0);
+    }
+
+    for batch in batches {
+        writer
+            .add_matched_batch(batch)
+            .map_err(to_datafusion_error)?;
+    }
+
+    let messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
+    if !messages.is_empty() {
+        wb.try_new_commit()
+            .map_err(to_datafusion_error)?
+            .commit(messages)
+            .await
+            .map_err(to_datafusion_error)?;
+    }
+
+    ok_result(ctx.ctx(), total_count)
+}
+
+/// Execute DELETE on an append-only table with retry on delete conflict.
+async fn execute_cow_delete(
+    ctx: &SQLContext,
+    delete: &Delete,
+    table: &Table,
+    table_ref: &str,
+) -> DFResult<DataFrame> {
+    retry_on_conflict("CoW DELETE", is_delete_conflict, || {
+        execute_cow_delete_once(ctx, delete, table, table_ref)
+    })
+    .await
+}
+
+/// Single attempt of CoW DELETE execution.
+async fn execute_cow_delete_once(
+    ctx: &SQLContext,
+    delete: &Delete,
+    table: &Table,
+    table_ref: &str,
+) -> DFResult<DataFrame> {
+    let where_str = delete.selection.as_ref().map(|e| e.to_string());
+    let partition_set =
+        build_partition_set_from_where(ctx, table, table_ref, where_str.as_deref()).await?;
+
+    let mut writer = CopyOnWriteMergeWriter::new(table, vec![], partition_set)
+        .await
+        .map_err(to_datafusion_error)?;
+
+    let mut temp_tracker = TempTableTracker::new(ctx);
+    let (has_data, cow_table_name) =
+        register_cow_target_table(ctx, table, &writer, &mut temp_tracker).await?;
+    if !has_data {
+        return ok_result(ctx.ctx(), 0);
+    }
+
+    let cow_target_qualified = cow_table_name;
+    let result = execute_cow_delete_inner(
+        ctx.ctx(),
+        &cow_target_qualified,
+        table_ref,
+        delete,
+        &mut writer,
+    )
+    .await;
+    let total_count = result?;
+
+    let messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
+    if !messages.is_empty() {
+        let commit = table
+            .new_write_builder()
+            .try_new_commit()
+            .map_err(to_datafusion_error)?;
+        commit.commit(messages).await.map_err(to_datafusion_error)?;
+    }
+
+    ok_result(ctx.ctx(), total_count)
+}
+
+async fn execute_cow_delete_inner(
+    ctx: &SessionContext,
+    cow_table_name: &str,
+    table_ref: &str,
+    delete: &Delete,
+    writer: &mut CopyOnWriteMergeWriter,
+) -> DFResult<u64> {
+    let selection_clause = build_dml_selection_clause(
+        delete.selection.as_ref(),
+        &delete.order_by,
+        delete.limit.as_ref(),
+    );
+    let alias = dml_table_alias(ctx, table_ref);
+    let query_sql = format!(
+        "SELECT \"__paimon_file_idx\", \"__paimon_row_offset\" \
+         FROM {cow_table_name} AS {alias}{selection_clause}"
+    );
+    let batches = ctx.sql(&query_sql).await?.collect().await?;
+
+    let mut total_count: u64 = 0;
+    for batch in &batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
+        let (file_idx_col, row_offset_col) = extract_tracking_columns(batch)?;
+
+        for row in 0..batch.num_rows() {
+            let file_idx = file_idx_col.value(row) as usize;
+            let row_offset = row_offset_col.value(row) as usize;
+            writer.add_matched_delete(file_idx, row_offset);
+            total_count += 1;
+        }
+    }
+
+    Ok(total_count)
+}

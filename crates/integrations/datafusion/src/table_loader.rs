@@ -23,6 +23,24 @@ use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
 
+#[cfg(feature = "dml")]
+/// [`Catalog::get_table`] for paths that need a `Table` rather than a
+/// [`paimon::catalog::LoadedTable`], rejecting an engine-served declared
+/// type: `get_table` is a trait method, so a catalog outside this repository
+/// can return a table for any type.
+pub(crate) async fn get_paimon_table(
+    catalog: &Arc<dyn Catalog>,
+    identifier: &Identifier,
+) -> DFResult<Table> {
+    let table = catalog
+        .get_table(identifier)
+        .await
+        .map_err(to_datafusion_error)?;
+    ensure_paimon_served(&table, identifier)?;
+    Ok(table)
+}
+
+/// Rejects tables whose declared type requires a separate table engine.
 pub(crate) fn ensure_paimon_served(table: &Table, identifier: &Identifier) -> DFResult<()> {
     let declared = paimon::spec::CoreOptions::new(table.schema().options())
         .table_type()

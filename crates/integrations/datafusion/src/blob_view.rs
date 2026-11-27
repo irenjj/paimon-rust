@@ -24,6 +24,8 @@ use arrow::array::{
     StringArray, StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType as ArrowDataType, Field, FieldRef};
+#[cfg(feature = "dml")]
+use datafusion::prelude::SessionContext;
 use datafusion_common::{DataFusionError, Result as DFResult};
 use datafusion_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
@@ -38,6 +40,14 @@ use crate::table_function_args::parse_table_identifier;
 use crate::table_loader::load_data_table_for_read;
 
 const FUNCTION_NAME: &str = "blob_view";
+
+#[cfg(feature = "dml")]
+pub fn register_blob_view(ctx: &SessionContext, catalog: Arc<dyn Catalog>, default_database: &str) {
+    ctx.register_udf(ScalarUDF::from(BlobViewFunc::new(
+        catalog,
+        default_database,
+    )));
+}
 
 /// Creates the scalar UDF that builds a Paimon blob view descriptor.
 pub fn blob_view(catalog: Arc<dyn Catalog>, default_database: &str) -> ScalarUDF {

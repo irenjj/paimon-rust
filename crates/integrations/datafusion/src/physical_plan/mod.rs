@@ -15,12 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(feature = "dml")]
+mod audit_log;
+#[cfg(feature = "dml")]
+mod range_partitioning;
 pub(crate) mod scan;
 mod search_score;
+#[cfg(feature = "dml")]
+pub(crate) mod sink;
 
+#[cfg(feature = "dml")]
+pub(crate) use audit_log::PaimonAuditLogScan;
 pub use scan::PaimonTableScan;
 pub(crate) use search_score::{SearchScoreExec, SearchScoreOutputColumn};
 
+#[cfg(feature = "dml")]
+pub use sink::PaimonDataSink;
+
+#[cfg(not(feature = "dml"))]
 mod range_partitioning {
     use std::sync::Arc;
 

@@ -34,6 +34,8 @@ use std::sync::Arc;
 use arrow::array::Array;
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef as ArrowSchemaRef};
 use async_trait::async_trait;
+#[cfg(feature = "dml")]
+use datafusion::prelude::SessionContext;
 use datafusion_catalog::TableProvider;
 use datafusion_catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion_common::{project_schema, ScalarValue};
@@ -63,6 +65,24 @@ use crate::DynamicOptions;
 
 const FUNCTION_NAME: &str = "hybrid_search";
 const SEARCH_SCORE_COLUMN: &str = "__paimon_search_score";
+
+#[cfg(feature = "dml")]
+pub fn register_hybrid_search(
+    ctx: &SessionContext,
+    catalog: Arc<dyn Catalog>,
+    default_database: &str,
+) {
+    ctx.register_udf(
+        datafusion::functions_nested::make_array::make_array_udf()
+            .as_ref()
+            .clone()
+            .with_aliases(["array"]),
+    );
+    ctx.register_udtf(
+        FUNCTION_NAME,
+        Arc::new(HybridSearchFunction::new(catalog, default_database)),
+    );
+}
 
 /// Table function implementation for `hybrid_search`.
 pub struct HybridSearchFunction {

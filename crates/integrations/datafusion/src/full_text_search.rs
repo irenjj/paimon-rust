@@ -29,6 +29,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use async_trait::async_trait;
+#[cfg(feature = "dml")]
+use datafusion::prelude::SessionContext;
 use datafusion_catalog::TableProvider;
 use datafusion_catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion_common::project_schema;
@@ -50,6 +52,19 @@ use crate::table_loader::load_data_table_for_read;
 use crate::DynamicOptions;
 
 const FUNCTION_NAME: &str = "full_text_search";
+
+#[cfg(feature = "dml")]
+/// Register the `full_text_search` table-valued function on a [`SessionContext`].
+pub fn register_full_text_search(
+    ctx: &SessionContext,
+    catalog: Arc<dyn Catalog>,
+    default_database: &str,
+) {
+    ctx.register_udtf(
+        "full_text_search",
+        Arc::new(FullTextSearchFunction::new(catalog, default_database)),
+    );
+}
 
 /// Table function implementation for `full_text_search`.
 pub struct FullTextSearchFunction {

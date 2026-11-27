@@ -31,6 +31,7 @@ categories = ["database"]
 keywords = ["paimon", "datafusion", "integrations"]
 
 [features]
+dml = []
 vortex = ["paimon/vortex"]
 
 [dependencies]

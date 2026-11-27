@@ -23,6 +23,8 @@ use arrow::datatypes::{Field, FieldRef};
 use datafusion_common::{plan_datafusion_err, Result};
 use datafusion_expr::planner::TypePlanner;
 use paimon::spec::{DataType as PaimonDataType, VectorType};
+#[cfg(feature = "dml")]
+use sqlparser::ast::ArrayElemTypeDef;
 use sqlparser::ast::{DataType, Expr, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::keywords::Keyword;
@@ -36,6 +38,78 @@ use crate::error::to_datafusion_error;
 #[derive(Default)]
 pub struct PaimonTypePlanner;
 
+#[cfg(feature = "dml")]
+impl TypePlanner for PaimonTypePlanner {
+    fn plan_type_field(&self, sql_type: &DataType) -> Result<Option<FieldRef>> {
+        let paimon_type = if let Some(vector) = sql_type_to_vector(sql_type, true)? {
+            Some(PaimonDataType::Vector(vector))
+        } else if matches!(sql_type, DataType::Map(_, _)) && contains_vector(sql_type) {
+            if contains_sql_type(sql_type, |ty| {
+                matches!(
+                    ty,
+                    DataType::Array(ArrayElemTypeDef::SquareBracket(_, Some(_)))
+                )
+            }) {
+                return Err(datafusion::error::DataFusionError::NotImplemented(
+                    "Fixed-size SQL arrays inside vector MAP types are not supported; use ARRAY<T> for variable-length collections".to_string(),
+                ));
+            }
+            // DataFusion 55.2 cannot plan MAP itself, including a MAP reached
+            // recursively from ARRAY/STRUCT. Use Paimon's mapping for vector maps.
+            Some(crate::sql_context::sql_data_type_to_paimon_type(
+                sql_type, true,
+            )?)
+        } else {
+            None
+        };
+        if let Some(paimon_type) = paimon_type {
+            let arrow_type =
+                paimon::arrow::paimon_type_to_arrow(&paimon_type).map_err(to_datafusion_error)?;
+            return Ok(Some(Arc::new(Field::new(
+                "",
+                arrow_type,
+                paimon_type.is_nullable(),
+            ))));
+        }
+        crate::binary_cast::BinaryTypePlanner.plan_type_field(sql_type)
+    }
+}
+
+#[cfg(feature = "dml")]
+fn contains_vector(sql_type: &DataType) -> bool {
+    contains_sql_type(sql_type, |ty| match ty {
+        DataType::Custom(name, _) => name
+            .0
+            .first()
+            .and_then(|part| part.as_ident())
+            .and_then(|ident| ident.value.get(..7))
+            .is_some_and(|prefix| name.0.len() == 1 && prefix.eq_ignore_ascii_case("VECTOR<")),
+        _ => false,
+    })
+}
+
+#[cfg(feature = "dml")]
+fn contains_sql_type(sql_type: &DataType, predicate: fn(&DataType) -> bool) -> bool {
+    if predicate(sql_type) {
+        return true;
+    }
+    match sql_type {
+        DataType::Array(
+            ArrayElemTypeDef::AngleBracket(element)
+            | ArrayElemTypeDef::SquareBracket(element, _)
+            | ArrayElemTypeDef::Parenthesis(element),
+        ) => contains_sql_type(element, predicate),
+        DataType::Map(key, value) => {
+            contains_sql_type(key, predicate) || contains_sql_type(value, predicate)
+        }
+        DataType::Struct(fields, _) => fields
+            .iter()
+            .any(|field| contains_sql_type(&field.field_type, predicate)),
+        _ => false,
+    }
+}
+
+#[cfg(not(feature = "dml"))]
 impl TypePlanner for PaimonTypePlanner {
     fn plan_type_field(&self, sql_type: &DataType) -> Result<Option<FieldRef>> {
         sql_type_to_vector(sql_type, true)?
@@ -322,9 +396,14 @@ pub(crate) fn sql_type_to_vector(
             VectorType::MAX_LENGTH
         )
     })?;
+    #[cfg(feature = "dml")]
+    let element = crate::sql_context::sql_data_type_to_paimon_type(&element, element_nullable)?;
+
+    #[cfg(not(feature = "dml"))]
     use paimon::spec::{
         BigIntType, BooleanType, DoubleType, FloatType, IntType, SmallIntType, TinyIntType,
     };
+    #[cfg(not(feature = "dml"))]
     let element = match element {
         DataType::Boolean => PaimonDataType::Boolean(BooleanType::with_nullable(element_nullable)),
         DataType::TinyInt(_) => {

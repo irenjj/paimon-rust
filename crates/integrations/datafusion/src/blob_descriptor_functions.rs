@@ -22,6 +22,8 @@ use arrow::array::{
     StringArray, StringBuilder, StringViewArray,
 };
 use arrow::datatypes::DataType as ArrowDataType;
+#[cfg(feature = "dml")]
+use datafusion::prelude::SessionContext;
 use datafusion_common::types::logical_binary;
 use datafusion_common::utils::take_function_args;
 use datafusion_common::{DataFusionError, Result as DFResult, ScalarValue};
@@ -35,6 +37,12 @@ use crate::error::to_datafusion_error;
 
 const PATH_TO_DESCRIPTOR: &str = "path_to_descriptor";
 const DESCRIPTOR_TO_STRING: &str = "descriptor_to_string";
+
+#[cfg(feature = "dml")]
+pub(crate) fn register_blob_descriptor_functions(ctx: &SessionContext) {
+    ctx.register_udf(ScalarUDF::from(PathToDescriptorFunc::new()));
+    ctx.register_udf(ScalarUDF::from(DescriptorToStringFunc::new()));
+}
 
 /// Creates `path_to_descriptor` and `descriptor_to_string` for host registration.
 pub fn blob_descriptor_functions() -> [ScalarUDF; 2] {
