@@ -16,6 +16,16 @@
 // under the License.
 
 use std::borrow::Cow;
+#[cfg(any(
+    all(windows, feature = "storage-fs"),
+    feature = "storage-azdls",
+    feature = "storage-cos",
+    feature = "storage-gcs",
+    feature = "storage-oss",
+    feature = "storage-obs",
+    feature = "storage-s3",
+    feature = "storage-hdfs"
+))]
 use std::collections::HashMap;
 #[cfg(any(
     all(windows, feature = "storage-fs"),
@@ -139,6 +149,7 @@ pub enum Storage {
 impl Storage {
     pub(crate) fn build(file_io_builder: FileIOBuilder) -> crate::Result<Self> {
         let (scheme_str, props, operator) = file_io_builder.into_parts();
+        let _ = &props;
         if let Some(op) = operator {
             return Ok(Self::CustomFs { op });
         }

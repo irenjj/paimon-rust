@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{panic_payload_message, timestamp_millis_schema, FilePredicates, FormatFileReader};
+use super::{
+    panic_payload_message, timestamp_millis_schema, FilePredicates, FormatFileReader,
+    MosaicPrefetchOptions, DEFAULT_PREFETCH_ROW_GROUPS,
+};
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::filtering::{
     predicates_may_match_with_schema, remap_predicates_to_file, StatsAccessor,
@@ -45,25 +48,6 @@ use std::ops::Range;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Row-group prefetch settings of one Mosaic file read, from the table options
-/// `mosaic.read.prefetch-row-groups` and `mosaic.read.prefetch-max-bytes`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MosaicPrefetchOptions {
-    /// Row groups kept opening ahead of the consumer; `0` reads on demand.
-    pub row_groups: usize,
-    /// Estimated decoded bytes allowed in flight beyond the head row group.
-    pub max_bytes: usize,
-}
-
-impl Default for MosaicPrefetchOptions {
-    fn default() -> Self {
-        Self {
-            row_groups: DEFAULT_PREFETCH_ROW_GROUPS,
-            max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct MosaicFormatReader {
     prefetch: MosaicPrefetchOptions,
@@ -76,8 +60,6 @@ impl MosaicFormatReader {
 }
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
-const DEFAULT_PREFETCH_ROW_GROUPS: usize = 8;
-const DEFAULT_PREFETCH_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EXECUTOR_WORKERS: usize = 32;
 
 #[async_trait]

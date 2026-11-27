@@ -27,17 +27,19 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::catalog::Session;
-use datafusion::catalog::TableFunctionImpl;
-use datafusion::common::project_schema;
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::ExecutionPlan;
+#[cfg(feature = "dml")]
 use datafusion::prelude::SessionContext;
+use datafusion_catalog::TableProvider;
+use datafusion_catalog::{TableFunctionArgs, TableFunctionImpl};
+use datafusion_common::project_schema;
+use datafusion_common::{DataFusionError, Result as DFResult};
+use datafusion_expr::TableType;
+use datafusion_expr::{Expr, TableProviderFilterPushDown};
+use datafusion_physical_plan::empty::EmptyExec;
+use datafusion_physical_plan::ExecutionPlan;
+use datafusion_session::Session;
 use paimon::catalog::Catalog;
 
 use crate::error::to_datafusion_error;
@@ -51,6 +53,7 @@ use crate::DynamicOptions;
 
 const FUNCTION_NAME: &str = "full_text_search";
 
+#[cfg(feature = "dml")]
 /// Register the `full_text_search` table-valued function on a [`SessionContext`].
 pub fn register_full_text_search(
     ctx: &SessionContext,
@@ -63,9 +66,7 @@ pub fn register_full_text_search(
     );
 }
 
-/// Table function that performs full-text search on a Paimon table.
-///
-/// Arguments: `(table_name STRING, column_name STRING, query_text STRING, limit INT)`
+/// Table function implementation for `full_text_search`.
 pub struct FullTextSearchFunction {
     catalog: Arc<dyn Catalog>,
     default_database: String,
@@ -85,7 +86,8 @@ impl FullTextSearchFunction {
         Self::new_with_dynamic_options(catalog, default_database, Default::default())
     }
 
-    pub(crate) fn new_with_dynamic_options(
+    /// Creates a table function that applies the host session’s read options.
+    pub fn new_with_dynamic_options(
         catalog: Arc<dyn Catalog>,
         default_database: &str,
         dynamic_options: DynamicOptions,
@@ -99,9 +101,10 @@ impl FullTextSearchFunction {
 }
 
 impl TableFunctionImpl for FullTextSearchFunction {
-    fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs<'_, '_>) -> DFResult<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != 4 {
-            return Err(datafusion::error::DataFusionError::Plan(
+            return Err(datafusion_common::DataFusionError::Plan(
                 "full_text_search requires 4 arguments: (table_name, column_name, query_text, limit)".to_string(),
             ));
         }
@@ -112,7 +115,7 @@ impl TableFunctionImpl for FullTextSearchFunction {
         let limit = extract_int_literal(FUNCTION_NAME, &args[3], "limit")?;
 
         if limit <= 0 {
-            return Err(datafusion::error::DataFusionError::Plan(
+            return Err(datafusion_common::DataFusionError::Plan(
                 "full_text_search: limit must be positive".to_string(),
             ));
         }
@@ -171,7 +174,7 @@ impl TableProvider for FullTextSearchTableProvider {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {

@@ -126,7 +126,7 @@ impl<'a> MultiVectorArray<'a> {
                     if list.is_null(index) {
                         return None;
                     }
-                    let start = list.value_offset(index) as usize;
+                    let start = list.value_offset_at(index);
                     (start, start + list.value_length() as usize)
                 }
             };

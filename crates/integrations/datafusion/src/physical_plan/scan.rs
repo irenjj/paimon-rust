@@ -17,39 +17,37 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::BooleanArray;
-use datafusion::arrow::compute::{cast, filter_record_batch};
-use datafusion::arrow::datatypes::{
-    DataType as ArrowDataType, SchemaRef as ArrowSchemaRef, TimeUnit,
-};
-use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use datafusion::common::stats::Precision;
-use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
-use datafusion::config::ConfigOptions;
-use datafusion::datasource::physical_plan::parquet::can_expr_be_pushed_down_with_schemas;
-use datafusion::error::Result as DFResult;
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::Operator;
-use datafusion::physical_expr::expressions::{
+use arrow::array::BooleanArray;
+use arrow::compute::{cast, filter_record_batch};
+use arrow::datatypes::{DataType as ArrowDataType, SchemaRef as ArrowSchemaRef, TimeUnit};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::Result as DFResult;
+use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
+use datafusion_datasource_parquet::can_expr_be_pushed_down_with_schemas;
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_expr::Operator;
+use datafusion_physical_expr::expressions::{
     BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr,
     Literal, NotExpr,
 };
-use datafusion::physical_expr::utils::{
+use datafusion_physical_expr::utils::{
     collect_columns, conjunction, reassign_expr_columns, split_conjunction,
 };
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_expr::{PhysicalExpr, PhysicalExprSimplifier, ScalarFunctionExpr};
-use datafusion::physical_expr_adapter::{
+use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{PhysicalExpr, PhysicalExprSimplifier, ScalarFunctionExpr};
+use datafusion_physical_expr_adapter::{
     DefaultPhysicalExprAdapterFactory, PhysicalExprAdapterFactory,
 };
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::filter_pushdown::{
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion_physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
+use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::{
     ChildrenPropertiesMode, DisplayAs, ExecutionPlan, Partitioning, PlanProperties,
     ReplaceChildrenOptions, StatisticsArgs,
 };
@@ -61,12 +59,19 @@ use paimon::spec::{
 use paimon::table::{ArrowRecordBatchStream, ScanStats, Table, TableRead};
 use paimon::DataSplit;
 
+#[cfg(not(feature = "dml"))]
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+#[cfg(not(feature = "dml"))]
+use paimon::resource::{MemoryPool, ResourceContext};
+
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::{is_float_zero, scalar_to_datum};
+#[cfg(feature = "dml")]
+use crate::memory::reader_resources;
 
 fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
-        return Err(datafusion::error::DataFusionError::Execution(format!(
+        return Err(datafusion_common::DataFusionError::Execution(format!(
             "Paimon reader returned {} columns for DataFusion schema with {} fields",
             batch.num_columns(),
             schema.fields().len()
@@ -117,16 +122,13 @@ impl paimon::arrow::RowFilter for DataFusionRowFilter {
         &self.projection
     }
 
-    fn evaluate(
-        &mut self,
-        batch: RecordBatch,
-    ) -> Result<BooleanArray, datafusion::arrow::error::ArrowError> {
+    fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, arrow::error::ArrowError> {
         let value = self
             .predicate
             .evaluate(&batch)
             .and_then(|value| value.into_array(batch.num_rows()))
             .map_err(|error| {
-                datafusion::arrow::error::ArrowError::ComputeError(format!(
+                arrow::error::ArrowError::ComputeError(format!(
                     "failed to evaluate DataFusion row filter: {error}"
                 ))
             })?;
@@ -135,7 +137,7 @@ impl paimon::arrow::RowFilter for DataFusionRowFilter {
             .downcast_ref::<BooleanArray>()
             .cloned()
             .ok_or_else(|| {
-                datafusion::arrow::error::ArrowError::ComputeError(format!(
+                arrow::error::ArrowError::ComputeError(format!(
                     "DataFusion row filter returned {}, expected Boolean",
                     value.data_type()
                 ))
@@ -145,12 +147,12 @@ impl paimon::arrow::RowFilter for DataFusionRowFilter {
 
 impl paimon::arrow::RowFilterFactory for DataFusionRowFilterFactory {
     fn supports_row_group_pruning(&self) -> bool {
-        datafusion::physical_expr::DynamicFilterTracking::classify(&self.predicate)
+        datafusion_physical_expr::DynamicFilterTracking::classify(&self.predicate)
             .contains_dynamic_filter()
     }
 
     fn pruning_predicates(&self, file_fields: &[DataField]) -> paimon::Result<Vec<Predicate>> {
-        let snapshot = datafusion::physical_expr_common::physical_expr::snapshot_physical_expr(
+        let snapshot = datafusion_physical_expr_common::physical_expr::snapshot_physical_expr(
             Arc::clone(&self.predicate),
         )
         .map_err(datafusion_row_filter_error)?;
@@ -220,14 +222,14 @@ impl paimon::arrow::RowFilterFactory for DataFusionRowFilterFactory {
     }
 }
 
-fn datafusion_row_filter_error(error: datafusion::error::DataFusionError) -> paimon::Error {
+fn datafusion_row_filter_error(error: datafusion_common::DataFusionError) -> paimon::Error {
     paimon::Error::UnexpectedError {
         message: format!("failed to adapt DataFusion row filter: {error}"),
         source: Some(Box::new(error)),
     }
 }
 
-fn datafusion_row_filter_arrow_error(error: datafusion::arrow::error::ArrowError) -> paimon::Error {
+fn datafusion_row_filter_arrow_error(error: arrow::error::ArrowError) -> paimon::Error {
     paimon::Error::UnexpectedError {
         message: format!("failed to project DataFusion row filter columns: {error}"),
         source: Some(Box::new(error)),
@@ -1077,7 +1079,7 @@ impl PaimonTableScan {
             + 'static,
     ) -> DFResult<SendableRecordBatchStream> {
         let splits = Arc::clone(self.planned_partitions.get(partition).ok_or_else(|| {
-            datafusion::error::DataFusionError::Internal(format!(
+            datafusion_common::DataFusionError::Internal(format!(
                 "PaimonTableScan: partition index {partition} out of range (total {})",
                 self.planned_partitions.len()
             ))
@@ -1093,8 +1095,7 @@ impl PaimonTableScan {
         let parquet_read_budget = Arc::clone(&self.parquet_read_budget);
 
         let fut = async move {
-            let resources = crate::memory::reader_resources(&context, partition)
-                .map_err(to_datafusion_error)?;
+            let resources = reader_resources(&context, partition).map_err(to_datafusion_error)?;
             let mut read_builder = table.new_read_builder();
             read_builder.with_resources(resources);
             let runtime_filter_plan = partition_runtime_decoder_filters(
@@ -1136,7 +1137,7 @@ impl PaimonTableScan {
                         .as_any()
                         .downcast_ref::<BooleanArray>()
                         .ok_or_else(|| {
-                            datafusion::error::DataFusionError::Execution(format!(
+                            datafusion_common::DataFusionError::Execution(format!(
                                 "Paimon runtime filter must return Boolean, got {}",
                                 predicate.data_type()
                             ))
@@ -1146,7 +1147,7 @@ impl PaimonTableScan {
                 Ok(batch)
             });
 
-            Ok::<_, datafusion::error::DataFusionError>(RecordBatchStreamAdapter::new(
+            Ok::<_, datafusion_common::DataFusionError>(RecordBatchStreamAdapter::new(
                 schema,
                 Box::pin(stream),
             ))
@@ -1155,6 +1156,11 @@ impl PaimonTableScan {
         let mut stream = Box::pin(futures::stream::once(fut).try_flatten());
         let metrics = BaselineMetrics::new(&self.metrics, partition);
         let measured = futures::stream::poll_fn(move |cx| {
+            // OpenDAL can perform I/O after the scan has yielded its stream.
+            let fallback = tokio::runtime::Handle::try_current()
+                .is_err()
+                .then(crate::runtime::runtime);
+            let _entered = fallback.as_ref().map(tokio::runtime::Handle::enter);
             let _timer = metrics.elapsed_compute().timer();
             metrics.record_poll(stream.as_mut().poll_next(cx))
         });
@@ -1163,6 +1169,47 @@ impl PaimonTableScan {
             measured,
         )))
     }
+}
+
+#[cfg(not(feature = "dml"))]
+#[derive(Debug)]
+struct DataFusionMemoryPool {
+    reservation: MemoryReservation,
+}
+
+#[cfg(not(feature = "dml"))]
+impl MemoryPool for DataFusionMemoryPool {
+    fn try_reserve(&self, bytes: usize) -> paimon::Result<()> {
+        self.reservation
+            .try_grow(bytes)
+            .map_err(|error| paimon::Error::ResourceExhausted {
+                message: error.to_string(),
+            })
+    }
+
+    fn release(&self, bytes: usize) {
+        self.reservation.shrink(bytes);
+    }
+}
+
+#[cfg(not(feature = "dml"))]
+fn reader_resources(context: &TaskContext, partition: usize) -> paimon::Result<ResourceContext> {
+    // Register per execution, not on the reusable plan. Reader working state
+    // cannot spill; downstream operators account for batches they retain.
+    resources(context, format!("PaimonTableScan[{partition}]"))
+}
+
+#[cfg(not(feature = "dml"))]
+fn resources(
+    context: &TaskContext,
+    consumer: impl Into<String>,
+) -> paimon::Result<ResourceContext> {
+    let reservation = MemoryConsumer::new(consumer)
+        .with_can_spill(false)
+        .register(context.memory_pool());
+    ResourceContext::builder()
+        .memory_pool(Arc::new(DataFusionMemoryPool { reservation }))
+        .build()
 }
 
 impl ExecutionPlan for PaimonTableScan {
@@ -1184,9 +1231,9 @@ impl ExecutionPlan for PaimonTableScan {
 
     fn try_swapping_with_projection(
         &self,
-        projection: &datafusion::physical_plan::projection::ProjectionExec,
+        projection: &datafusion_physical_plan::projection::ProjectionExec,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        use datafusion::physical_plan::projection::ProjectionExec;
+        use datafusion_physical_plan::projection::ProjectionExec;
         let Some(indices) = projection
             .expr()
             .iter()
@@ -1263,7 +1310,7 @@ impl ExecutionPlan for PaimonTableScan {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
     ) -> DFResult<TreeNodeRecursion> {
-        datafusion::physical_plan::apply_expression_roots(
+        datafusion_physical_plan::apply_expression_roots(
             self.runtime_filters.iter().chain(&self.decoder_filters),
             f,
         )
@@ -1415,7 +1462,7 @@ impl ExecutionPlan for PaimonTableScan {
 impl DisplayAs for PaimonTableScan {
     fn fmt_as(
         &self,
-        _t: datafusion::physical_plan::DisplayFormatType,
+        _t: datafusion_physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         write!(f, "PaimonTableScan: table={}", self.table.identifier())?;
@@ -1483,22 +1530,21 @@ mod tests {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/test_utils.rs"));
     }
 
-    use datafusion::arrow::array::Int32Array;
-    use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use datafusion::common::DFSchema;
-    use datafusion::config::ConfigOptions;
-    use datafusion::logical_expr::Operator;
-    use datafusion::physical_expr::expressions::{
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use datafusion_common::config::ConfigOptions;
+    use datafusion_common::DFSchema;
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::{
         lit, BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, IsNotNullExpr, IsNullExpr,
         LikeExpr, NotExpr,
     };
-    use datafusion::physical_expr::PhysicalExpr;
-    use datafusion::physical_expr::{create_physical_expr, execution_props::ExecutionProps};
-    use datafusion::physical_plan::filter_pushdown::{
+    use datafusion_physical_expr::PhysicalExpr;
+    use datafusion_physical_expr::{create_physical_expr, execution_props::ExecutionProps};
+    use datafusion_physical_plan::filter_pushdown::{
         ChildFilterPushdownResult, ChildPushdownResult,
     };
-    use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::prelude::SessionContext;
+    use datafusion_physical_plan::ExecutionPlan;
     use futures::TryStreamExt;
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
@@ -1560,7 +1606,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_row_group_pruning_preserves_nan_after_threshold_updates() {
-        use datafusion::arrow::array::{ArrayRef, Float32Array, Float64Array};
+        use arrow::array::{ArrayRef, Float32Array, Float64Array};
         use paimon::spec::{DoubleType, FloatType};
         use parquet::arrow::ArrowWriter;
         use parquet::file::properties::WriterProperties;
@@ -1864,7 +1910,7 @@ mod tests {
             true,
         );
 
-        let context = datafusion::physical_plan::StatisticsContext::new();
+        let context = datafusion_physical_plan::StatisticsContext::new();
         let statistics = context.compute(&scan, &StatisticsArgs::new()).unwrap();
         let id = &statistics.column_statistics[0];
 
@@ -2320,7 +2366,7 @@ mod tests {
 
     #[test]
     fn test_datafusion_factory_builds_format_neutral_row_filter() {
-        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         let tempdir = tempdir().unwrap();
         let parquet_path = tempdir.path().join("data.parquet");
@@ -2502,16 +2548,15 @@ mod tests {
             .unwrap();
         let arrow_schema = ArrowSchema::new(vec![Field::new("name", ArrowDataType::Utf8, true)]);
         let df_schema = DFSchema::try_from(arrow_schema).unwrap();
-        let logical = datafusion::functions::string::expr_fn::starts_with(
-            datafusion::logical_expr::col("name"),
-            datafusion::logical_expr::lit("ab"),
+        let logical = datafusion_functions::string::expr_fn::starts_with(
+            datafusion_expr::col("name"),
+            datafusion_expr::lit("ab"),
         );
         let physical = create_physical_expr(
             &logical,
             &df_schema,
             &ExecutionProps::new(),
-            &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(
-            ),
+            &datafusion_expr::physical_planning_context::PhysicalPlanningContext::default(),
         )
         .unwrap();
 
@@ -2575,8 +2620,8 @@ mod tests {
 
     #[test]
     fn test_datafusion_decoder_filter_observes_live_dynamic_update() {
-        use datafusion::arrow::record_batch::RecordBatch;
-        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         let tempdir = tempdir().unwrap();
         let parquet_path = tempdir.path().join("data.parquet");
@@ -2648,7 +2693,7 @@ mod tests {
 
     #[test]
     fn test_completed_dynamic_float_zero_filter_keeps_both_signed_zeros() {
-        use datafusion::arrow::array::{ArrayRef, Float32Array, Float64Array};
+        use arrow::array::{ArrayRef, Float32Array, Float64Array};
         use paimon::spec::{DoubleType, FloatType};
 
         type FilterCase = (Arc<dyn PhysicalExpr>, Vec<Option<bool>>);
@@ -2689,11 +2734,6 @@ mod tests {
             )]));
             let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values]).unwrap();
             let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("value", 0));
-            let is_negative_zero = match &zero {
-                ScalarValue::Float32(Some(value)) => value.is_sign_negative(),
-                ScalarValue::Float64(Some(value)) => value.is_sign_negative(),
-                _ => unreachable!(),
-            };
             let literal = lit(zero);
             let mut cases: Vec<FilterCase> = Vec::new();
             for (op, expected) in [
@@ -2722,8 +2762,6 @@ mod tests {
                 )),
                 vec![Some(false), Some(true), Some(true), Some(true), None],
             ));
-            // Physical IN retains total-order equality even though BinaryExpr
-            // comparisons normalize signed zeros. Preserve each expression's semantics.
             for negated in [false, true] {
                 cases.push((
                     Arc::new(
@@ -2735,7 +2773,7 @@ mod tests {
                         )
                         .unwrap(),
                     ),
-                    [false, is_negative_zero, !is_negative_zero, false]
+                    [false, true, true, false]
                         .into_iter()
                         .map(|matched| Some(matched != negated))
                         .chain([None])
@@ -2941,62 +2979,69 @@ mod tests {
     }
 
     fn memory_session(
-        pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
-    ) -> SessionContext {
-        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-        SessionContext::new_with_config_rt(
-            datafusion::prelude::SessionConfig::new(),
-            RuntimeEnvBuilder::new()
-                .with_memory_pool(pool)
-                .build_arc()
-                .unwrap(),
+        pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool>,
+    ) -> Arc<TaskContext> {
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        Arc::new(
+            TaskContext::default().with_runtime(
+                RuntimeEnvBuilder::new()
+                    .with_memory_pool(pool)
+                    .build_arc()
+                    .unwrap(),
+            ),
         )
     }
 
     #[tokio::test]
-    async fn scan_memory_honors_each_execution_pool_and_audit_reads() {
-        use datafusion::error::DataFusionError;
-        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-        for audit in [false, true] {
-            let (_dir, scan, estimate) = memory_scan_fixture();
-            let plan: Arc<dyn ExecutionPlan> = if audit {
-                Arc::new(super::super::audit_log::PaimonAuditLogScan::new(scan))
-            } else {
-                Arc::new(scan)
-            };
-            let rejected = Arc::new(GreedyMemoryPool::new(0));
-            let ctx = memory_session(rejected.clone());
-            let mut stream = plan.execute(0, ctx.task_ctx()).unwrap();
-            assert!(matches!(
-                stream.try_next().await,
-                Err(DataFusionError::ResourcesExhausted(_))
-            ));
-            assert!(stream.try_next().await.unwrap().is_none());
-            assert_eq!(rejected.reserved(), 0);
+    async fn scan_memory_honors_each_execution_pool() {
+        let (_dir, scan, estimate) = memory_scan_fixture();
+        assert_scan_memory_honors_pool(&scan, estimate).await;
+    }
 
-            // Reusing a plan must bind to the current execution, never an earlier pool.
-            let admitted = Arc::new(GreedyMemoryPool::new(estimate));
-            let ctx = memory_session(admitted.clone());
-            let output = plan
-                .execute(0, ctx.task_ctx())
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            assert_eq!(collect_ids(&output), (0..8).collect::<Vec<_>>());
-            assert_eq!(
-                admitted.reserved(),
-                0,
-                "returned batches belong to their consumer"
-            );
-            assert_eq!(rejected.reserved(), 0);
-        }
+    #[cfg(all(test, feature = "dml"))]
+    #[tokio::test]
+    async fn audit_scan_memory_honors_each_execution_pool() {
+        let (_dir, scan, estimate) = memory_scan_fixture();
+        let plan = super::super::audit_log::PaimonAuditLogScan::new(scan);
+        assert_scan_memory_honors_pool(&plan, estimate).await;
+    }
+
+    async fn assert_scan_memory_honors_pool(plan: &dyn ExecutionPlan, estimate: usize) {
+        use datafusion_common::DataFusionError;
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+
+        let rejected = Arc::new(GreedyMemoryPool::new(0));
+        let ctx = memory_session(rejected.clone());
+        let mut stream = plan.execute(0, Arc::clone(&ctx)).unwrap();
+        assert!(matches!(
+            stream.try_next().await,
+            Err(DataFusionError::ResourcesExhausted(_))
+        ));
+        assert!(stream.try_next().await.unwrap().is_none());
+        assert_eq!(rejected.reserved(), 0);
+
+        // Reusing a plan must bind to the current execution, never an earlier pool.
+        let admitted = Arc::new(GreedyMemoryPool::new(estimate));
+        let ctx = memory_session(admitted.clone());
+        let output = plan
+            .execute(0, Arc::clone(&ctx))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(&output), (0..8).collect::<Vec<_>>());
+        assert_eq!(
+            admitted.reserved(),
+            0,
+            "returned batches belong to their consumer"
+        );
+        assert_eq!(rejected.reserved(), 0);
     }
 
     #[tokio::test]
     async fn scan_memory_shares_capacity_with_partitions_and_downstream_consumers() {
-        use datafusion::error::DataFusionError;
-        use datafusion::execution::memory_pool::{FairSpillPool, MemoryConsumer, MemoryPool};
+        use datafusion_common::DataFusionError;
+        use datafusion_execution::memory_pool::{FairSpillPool, MemoryConsumer, MemoryPool};
         let (_dir, scan, estimate) = memory_scan_fixture();
         let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(2 * estimate));
         let ctx = memory_session(pool.clone());
@@ -3007,10 +3052,10 @@ mod tests {
             .register(&pool);
         let downstream = MemoryConsumer::new("downstream state").register(&pool);
         downstream.try_grow(estimate).unwrap();
-        let mut first = scan.execute(0, ctx.task_ctx()).unwrap();
+        let mut first = scan.execute(0, Arc::clone(&ctx)).unwrap();
         let retained = first.try_next().await.unwrap().unwrap();
         assert_eq!(pool.reserved(), 2 * estimate);
-        let mut second = scan.execute(1, ctx.task_ctx()).unwrap();
+        let mut second = scan.execute(1, Arc::clone(&ctx)).unwrap();
         assert!(matches!(
             second.try_next().await,
             Err(DataFusionError::ResourcesExhausted(_))
@@ -3029,7 +3074,7 @@ mod tests {
         drop(downstream);
         assert_eq!(pool.reserved(), 0);
         let output = scan
-            .execute(1, ctx.task_ctx())
+            .execute(1, Arc::clone(&ctx))
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -3108,7 +3153,7 @@ mod tests {
 
         let filtered_scan = result.updated_node.unwrap();
         let batches = filtered_scan
-            .execute(0, SessionContext::new().task_ctx())
+            .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -3199,9 +3244,9 @@ mod tests {
             true,
         );
 
-        let ctx = SessionContext::new();
+        let ctx = Arc::new(TaskContext::default());
         let stream = scan
-            .execute(0, ctx.task_ctx())
+            .execute(0, Arc::clone(&ctx))
             .expect("execute should succeed");
         let batches = stream.try_collect::<Vec<_>>().await.unwrap();
 
@@ -3272,9 +3317,9 @@ mod tests {
             true,
         );
 
-        let ctx = SessionContext::new();
+        let ctx = Arc::new(TaskContext::default());
         let batches = scan
-            .execute(0, ctx.task_ctx())
+            .execute(0, Arc::clone(&ctx))
             .expect("execute should succeed")
             .try_collect::<Vec<_>>()
             .await

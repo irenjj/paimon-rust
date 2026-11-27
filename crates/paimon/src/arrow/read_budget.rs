@@ -238,6 +238,7 @@ impl ReadBudget {
     }
 
     /// Take scheduling capacity and memory if both are available now.
+    #[cfg(any(test, feature = "format-mosaic"))]
     pub(crate) fn try_acquire(&self, estimated_bytes: u64) -> Option<ReadPermit> {
         let row_group = Arc::clone(&self.row_groups).try_acquire_owned().ok()?;
         let prefetch = Arc::clone(&self.prefetch)
@@ -284,6 +285,7 @@ impl ReadBudget {
 
     /// Block until a row-group slot and the estimated bytes are free. The
     /// Mosaic reader decodes on its own threads, so it waits here.
+    #[cfg(any(test, feature = "format-mosaic"))]
     pub(crate) fn acquire_blocking(&self, estimated_bytes: u64) -> crate::Result<ReadPermit> {
         futures::executor::block_on(self.acquire(estimated_bytes))
     }

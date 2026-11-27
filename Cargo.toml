@@ -17,40 +17,32 @@
 
 [workspace]
 resolver = "2"
-members = [
-    "crates/paimon",
-    "crates/paimon-rest-server",
-    "crates/integration_tests",
-    "bindings/c",
-    "bindings/python",
-    "crates/integrations/datafusion",
-    "benchmarks/tpcds",
-]
+members = ["crates/integrations/datafusion"]
+# Cargo resolves the entire workspace when building its lockfile, even with -p.
+exclude = ["crates/paimon"]
 
 [workspace.package]
 version = "0.6.0"
 edition = "2021"
-homepage = "https://paimon.apache.org/docs/rust/"
-repository = "https://github.com/apache/paimon-rust"
 license = "Apache-2.0"
 rust-version = "1.95.0"
 
 [workspace.dependencies]
-arrow = "59.2"
-arrow-array = { version = "59.2", features = ["ffi"] }
-arrow-arith = "59.2"
-arrow-buffer = "59.2"
-arrow-schema = "59.2"
-arrow-cast = "59.2"
-arrow-ord = "59.2"
-arrow-row = "59.2"
-arrow-select = "59.2"
-arrow-string = "59.2"
-datafusion = "55.2.0"
-datafusion-ffi = "55.2.0"
-datafusion-spark = { version = "55.2.0", features = ["core"] }
-paimon = { version = "0.6.0", path = "crates/paimon" }
-parquet = "59.3.3"
-constant_time_eq = ">=0.4.0, <0.5.0"
+arrow = "60.2.0"
+arrow-select = "60.2.0"
+datafusion-common = { version = "=57.0.0-dev", default-features = false }
+datafusion-expr = { version = "=57.0.0-dev", default-features = false }
+datafusion-session = { version = "=57.0.0-dev", default-features = false }
+datafusion-catalog = { version = "=57.0.0-dev", default-features = false }
+datafusion-datasource = { version = "=57.0.0-dev", default-features = false }
+datafusion-datasource-parquet = { version = "=57.0.0-dev", default-features = false }
+datafusion-execution = { version = "=57.0.0-dev", default-features = false }
+datafusion-physical-plan = { version = "=57.0.0-dev", default-features = false }
+datafusion-physical-expr = { version = "=57.0.0-dev", default-features = false }
+datafusion-physical-expr-adapter = { version = "=57.0.0-dev", default-features = false }
+datafusion-functions-nested = { version = "=57.0.0-dev", default-features = false }
+datafusion-physical-expr-common = { version = "=57.0.0-dev", default-features = false }
+datafusion-functions = { version = "=57.0.0-dev", default-features = false }
+paimon = { version = "0.6.0", path = "crates/paimon", default-features = false }
+parquet = "60.2.0"
 tokio = "1.39.2"
-tokio-util = "0.7"

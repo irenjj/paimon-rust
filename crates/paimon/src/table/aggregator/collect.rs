@@ -461,7 +461,7 @@ fn java_equals(left: &dyn Array, i: usize, right: &dyn Array, j: usize) -> bool 
         }
         ArrowDataType::FixedSizeList(_, size) => {
             let (l, r) = (left.as_fixed_size_list(), right.as_fixed_size_list());
-            let (ls, rs) = (l.value_offset(i) as usize, r.value_offset(j) as usize);
+            let (ls, rs) = (l.value_offset_at(i), r.value_offset_at(j));
             (0..*size as usize)
                 .all(|k| java_equals(l.values().as_ref(), ls + k, r.values().as_ref(), rs + k))
         }

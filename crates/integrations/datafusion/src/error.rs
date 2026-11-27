@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::common::error::GenericError;
+use datafusion_common::error::GenericError;
 
 /// Converts a Paimon error into a DataFusion error.
-pub fn to_datafusion_error(error: paimon::Error) -> datafusion::error::DataFusionError {
+pub fn to_datafusion_error(error: paimon::Error) -> datafusion_common::DataFusionError {
     match error {
         paimon::Error::ResourceExhausted { message } => {
-            datafusion::error::DataFusionError::ResourcesExhausted(message)
+            datafusion_common::DataFusionError::ResourcesExhausted(message)
         }
-        other => datafusion::error::DataFusionError::External(GenericError::from(other)),
+        other => datafusion_common::DataFusionError::External(GenericError::from(other)),
     }
 }

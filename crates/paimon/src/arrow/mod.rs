@@ -412,7 +412,7 @@ fn build_arrow_schema(fields: &[DataField], for_read: bool) -> crate::Result<Arc
             let mut field = paimon_arrow_field(f.name(), f.data_type(), for_read)?;
             field
                 .metadata_mut()
-                .insert(PARQUET_FIELD_ID_META_KEY.into(), f.id().to_string());
+                .insert(PARQUET_FIELD_ID_META_KEY, f.id().to_string());
             Ok(with_generation_expression(field, f))
         })
         .collect::<crate::Result<Vec<_>>>()?;
@@ -463,10 +463,10 @@ fn paimon_arrow_field(
     .map_err(geoarrow_metadata_error)?;
     field
         .metadata_mut()
-        .insert(EXTENSION_TYPE_NAME_KEY.into(), GEOARROW_WKB.into());
+        .insert(EXTENSION_TYPE_NAME_KEY, GEOARROW_WKB);
     field
         .metadata_mut()
-        .insert(EXTENSION_TYPE_METADATA_KEY.into(), metadata);
+        .insert(EXTENSION_TYPE_METADATA_KEY, metadata);
     Ok(field)
 }
 
@@ -546,15 +546,15 @@ mod tests {
 
         let mut field = ArrowField::new("geom", ArrowDataType::Binary, true);
         field.metadata_mut().insert(
-            arrow_schema::extension::EXTENSION_TYPE_NAME_KEY.into(),
-            GEOARROW_WKB.into(),
+            arrow_schema::extension::EXTENSION_TYPE_NAME_KEY,
+            GEOARROW_WKB,
         );
         for (metadata, expected) in [
             (format!(r#"{{"crs":{projjson}}}"#), projjson.trim()),
             ("{}".to_owned(), "srid:0"),
         ] {
             field.metadata_mut().insert(
-                arrow_schema::extension::EXTENSION_TYPE_METADATA_KEY.into(),
+                arrow_schema::extension::EXTENSION_TYPE_METADATA_KEY,
                 metadata,
             );
             assert_eq!(

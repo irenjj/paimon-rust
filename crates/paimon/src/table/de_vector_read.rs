@@ -3109,7 +3109,7 @@ fn collect_raw_batch_vector_batch(
             }
             VectorLayout::Fixed(a) => {
                 let len = a.value_length() as usize;
-                let start = a.value_offset(row) as usize;
+                let start = a.value_offset_at(row);
                 (start, start + len)
             }
         };

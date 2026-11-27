@@ -17,38 +17,64 @@
 
 //! Paimon catalog integration for DataFusion.
 
+#[cfg(feature = "dml")]
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::sync::Arc;
+#[cfg(feature = "dml")]
 use std::sync::RwLock;
 
 use async_trait::async_trait;
-use datafusion::catalog::{CatalogProvider, MemorySchemaProvider, SchemaProvider};
+#[cfg(feature = "dml")]
 use datafusion::common::{plan_datafusion_err, Column};
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
+#[cfg(feature = "dml")]
+use datafusion::datasource::TableType;
+#[cfg(feature = "dml")]
 use datafusion::execution::SessionState;
+#[cfg(feature = "dml")]
 use datafusion::logical_expr::{expr_fn::cast, Expr, LogicalPlan, LogicalPlanBuilder};
+#[cfg(feature = "dml")]
 use datafusion::prelude::SessionContext;
+#[cfg(feature = "dml")]
 use datafusion::sql::planner::IdentNormalizer;
+#[cfg(feature = "dml")]
 use datafusion::sql::sqlparser::ast::{Ident, ObjectName, Statement};
+#[cfg(feature = "dml")]
 use datafusion::sql::sqlparser::dialect::GenericDialect;
+#[cfg(feature = "dml")]
 use datafusion::sql::sqlparser::parser::Parser;
-use paimon::catalog::{Catalog, Identifier, View};
+#[cfg(feature = "dml")]
+use datafusion_catalog::MemorySchemaProvider;
+use datafusion_catalog::{CatalogProvider, SchemaProvider, TableProvider};
+use datafusion_common::Result as DFResult;
+#[cfg(feature = "dml")]
+use paimon::catalog::View;
+use paimon::catalog::{Catalog, Identifier};
+#[cfg(feature = "dml")]
 use paimon::spec::TableType as PaimonTableType;
 
 use crate::error::to_datafusion_error;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
+#[cfg(feature = "dml")]
 use crate::system_tables;
-use crate::table::{ObjectTableProvider, PaimonTableProvider};
+#[cfg(not(feature = "dml"))]
+use crate::table::build_table_definition;
+#[cfg(feature = "dml")]
+use crate::table::ObjectTableProvider;
+use crate::table::PaimonTableProvider;
+#[cfg(not(feature = "dml"))]
+use crate::table_loader::loaded_table_for_read;
 use crate::{BlobReaderRegistry, DynamicOptions};
 
+#[cfg(feature = "dml")]
 pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Send + Sync>;
 
+#[cfg(feature = "dml")]
 /// Engine registry shared between the catalog provider and its schema
 /// providers, so registrations stay visible to schemas obtained earlier.
 type TableEngines = Arc<RwLock<HashMap<PaimonTableType, Arc<dyn TableEngineResolver>>>>;
 
+#[cfg(feature = "dml")]
 /// Identifies an engine-owned table.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -59,6 +85,7 @@ pub struct EngineTableRequest {
     pub declared: PaimonTableType,
 }
 
+#[cfg(feature = "dml")]
 impl EngineTableRequest {
     pub fn new(database: String, table: String, declared: PaimonTableType) -> Self {
         Self {
@@ -69,6 +96,7 @@ impl EngineTableRequest {
     }
 }
 
+#[cfg(feature = "dml")]
 /// Resolves external tables. `Ok(None)` means missing; engine errors propagate.
 #[async_trait]
 pub trait TableEngineResolver: Debug + Send + Sync {
@@ -122,6 +150,7 @@ pub trait TableEngineResolver: Debug + Send + Sync {
 }
 
 /// Delegates reads to the engine and rejects DML.
+#[cfg(feature = "dml")]
 #[derive(Debug, Clone)]
 pub(crate) struct ReadOnlyTableProvider {
     inner: Arc<dyn TableProvider>,
@@ -134,12 +163,14 @@ pub(crate) struct ReadOnlyTableProvider {
 }
 
 /// The historical state requested from an engine.
+#[cfg(feature = "dml")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum EngineTimeTravel {
     Snapshot(i64),
     TimestampMillis(i64),
 }
 
+#[cfg(feature = "dml")]
 impl std::fmt::Display for EngineTimeTravel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -149,6 +180,7 @@ impl std::fmt::Display for EngineTimeTravel {
     }
 }
 
+#[cfg(feature = "dml")]
 pub(crate) fn unsupported_engine_time_travel(
     declared: PaimonTableType,
     table_name: &str,
@@ -160,6 +192,7 @@ pub(crate) fn unsupported_engine_time_travel(
     )
 }
 
+#[cfg(feature = "dml")]
 impl ReadOnlyTableProvider {
     pub(crate) fn unsupported_time_travel(&self) -> datafusion::error::DataFusionError {
         unsupported_engine_time_travel(self.declared, &self.table_name)
@@ -182,6 +215,7 @@ impl ReadOnlyTableProvider {
     }
 }
 
+#[cfg(feature = "dml")]
 pub(crate) fn parse_engine_snapshot_id(version: &str) -> DFResult<i64> {
     version.parse().map_err(|_| {
         plan_datafusion_err!(
@@ -190,6 +224,7 @@ pub(crate) fn parse_engine_snapshot_id(version: &str) -> DFResult<i64> {
     })
 }
 
+#[cfg(feature = "dml")]
 async fn resolve_engine_time_travel(
     request: EngineTableRequest,
     resolver: Arc<dyn TableEngineResolver>,
@@ -229,6 +264,7 @@ async fn resolve_engine_time_travel(
     .await
 }
 
+#[cfg(feature = "dml")]
 #[async_trait]
 impl TableProvider for ReadOnlyTableProvider {
     fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
@@ -294,6 +330,7 @@ impl TableProvider for ReadOnlyTableProvider {
     }
 }
 
+#[cfg(feature = "dml")]
 /// Exposes an unregistered engine's table schema while rejecting scans and writes.
 #[derive(Debug)]
 pub(crate) struct UnavailableEngineTableProvider {
@@ -302,6 +339,7 @@ pub(crate) struct UnavailableEngineTableProvider {
     table_name: String,
 }
 
+#[cfg(feature = "dml")]
 impl UnavailableEngineTableProvider {
     pub(crate) fn unavailable_error(&self) -> datafusion::error::DataFusionError {
         plan_datafusion_err!(
@@ -312,6 +350,7 @@ impl UnavailableEngineTableProvider {
     }
 }
 
+#[cfg(feature = "dml")]
 #[async_trait]
 impl TableProvider for UnavailableEngineTableProvider {
     fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
@@ -342,6 +381,7 @@ impl TableProvider for UnavailableEngineTableProvider {
     }
 }
 
+#[cfg(feature = "dml")]
 /// Register `resolver` as the engine for `table_type` on the Paimon catalog
 /// named `catalog_name`.
 ///
@@ -371,22 +411,29 @@ pub fn register_catalog_table_engine(
 /// This provider uses lazy loading - databases and tables are fetched
 /// on-demand from the catalog, ensuring data is always fresh.
 ///
-/// # Table-version clauses
-///
-/// SQL queries using `VERSION`/`TIMESTAMP AS OF` need
-/// [`PaimonRelationPlanner`](crate::PaimonRelationPlanner) installed on the
-/// session; DataFusion's default planner drops the clause before this crate
-/// sees it, so the query would read current data. [`SQLContext`](crate::SQLContext)
-/// installs it, as does
-/// [`register_catalog_table_engine`]. A plain `SessionContext` querying Paimon
-/// tables directly must install it with
-/// `ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))`.
+#[cfg_attr(
+    feature = "dml",
+    doc = r#"
+# Table-version clauses
+
+SQL queries using `VERSION`/`TIMESTAMP AS OF` need
+[`PaimonRelationPlanner`](crate::PaimonRelationPlanner) installed on the
+session; DataFusion's default planner drops the clause before this crate
+sees it, so the query would read current data. [`SQLContext`](crate::SQLContext)
+installs it, as does
+[`register_catalog_table_engine`]. A plain `SessionContext` querying Paimon
+tables directly must install it with
+`ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))`.
+"#
+)]
 pub struct PaimonCatalogProvider {
+    #[cfg(feature = "dml")]
     catalog_name: Option<String>,
     /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
     /// Session-scoped dynamic options shared with the SQL context.
     dynamic_options: DynamicOptions,
+    #[cfg(feature = "dml")]
     /// Temporary in-memory tables and views stored in MemorySchemaProvider per database.
     ///
     /// Uses `RwLock` with poison recovery (`unwrap_or_else(|e| e.into_inner())`) throughout.
@@ -396,8 +443,10 @@ pub struct PaimonCatalogProvider {
     /// becoming invisible or stale, which is recoverable by re-registering it.
     temp_tables: Arc<RwLock<HashMap<String, Arc<MemorySchemaProvider>>>>,
     blob_reader_registry: BlobReaderRegistry,
+    #[cfg(feature = "dml")]
     session_state: Option<SessionStateProvider>,
     schema_force_view_types: bool,
+    #[cfg(feature = "dml")]
     /// Engines for table types served elsewhere, keyed by declared
     /// [`PaimonTableType`]. Same poison-recovery stance as `temp_tables`.
     table_engines: TableEngines,
@@ -405,11 +454,35 @@ pub struct PaimonCatalogProvider {
 
 impl Debug for PaimonCatalogProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PaimonCatalogProvider").finish()
+        f.debug_struct("PaimonCatalogProvider")
+            .finish_non_exhaustive()
     }
 }
 
 impl PaimonCatalogProvider {
+    #[cfg(not(feature = "dml"))]
+    /// Creates a provider with shared read options and a descriptor reader registry.
+    pub fn new(
+        catalog: Arc<dyn Catalog>,
+        dynamic_options: DynamicOptions,
+        blob_reader_registry: BlobReaderRegistry,
+    ) -> Self {
+        if let Some(filesystem) = catalog
+            .as_any()
+            .and_then(|catalog| catalog.downcast_ref::<paimon::FileSystemCatalog>())
+        {
+            blob_reader_registry
+                .register_catalog_location(filesystem.warehouse(), filesystem.file_io().clone());
+        }
+        Self {
+            catalog,
+            dynamic_options,
+            blob_reader_registry,
+            schema_force_view_types: true,
+        }
+    }
+
+    #[cfg(feature = "dml")]
     /// Creates a new [`PaimonCatalogProvider`].
     pub fn new(
         catalog_name: Option<String>,
@@ -440,6 +513,7 @@ impl PaimonCatalogProvider {
         self
     }
 
+    #[cfg(feature = "dml")]
     /// Register an engine for a table type the Paimon reader cannot serve
     /// (e.g. [`PaimonTableType::IcebergTable`]); everything else takes the
     /// Paimon path unchanged. Kept inside the provider so the registered
@@ -465,10 +539,12 @@ impl PaimonCatalogProvider {
         Ok(())
     }
 
+    #[cfg(feature = "dml")]
     fn table_engines(&self) -> TableEngines {
         Arc::clone(&self.table_engines)
     }
 
+    #[cfg(feature = "dml")]
     pub(crate) async fn table_at_time_travel(
         &self,
         request: EngineTableRequest,
@@ -492,6 +568,7 @@ impl PaimonCatalogProvider {
             .await
     }
 
+    #[cfg(feature = "dml")]
     fn paimon_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
         let catalog = Arc::clone(&self.catalog);
         let table_engines = self.table_engines();
@@ -558,8 +635,8 @@ impl CatalogProvider for PaimonCatalogProvider {
         let catalog = Arc::clone(&self.catalog);
         block_on_with_runtime(
             async move {
-                catalog.list_databases().await.unwrap_or_else(|e| {
-                    log::error!("failed to list databases: {e}");
+                catalog.list_databases().await.unwrap_or_else(|error| {
+                    log::error!("failed to list Paimon databases: {error}");
                     vec![]
                 })
             },
@@ -567,10 +644,37 @@ impl CatalogProvider for PaimonCatalogProvider {
         )
     }
 
+    #[cfg(not(feature = "dml"))]
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        let catalog = Arc::clone(&self.catalog);
+        let name = name.to_owned();
+        let database = name.clone();
+        let exists = block_on_with_runtime(
+            async move { catalog.get_database(&database).await },
+            "paimon catalog access thread panicked",
+        );
+        match exists {
+            Ok(_) => Some(Arc::new(PaimonSchemaProvider {
+                catalog: Arc::clone(&self.catalog),
+                database: name,
+                dynamic_options: Arc::clone(&self.dynamic_options),
+                blob_reader_registry: self.blob_reader_registry.clone(),
+                schema_force_view_types: self.schema_force_view_types,
+            })),
+            Err(paimon::Error::DatabaseNotExist { .. }) => None,
+            Err(error) => {
+                log::error!("failed to load Paimon database '{name}': {error}");
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "dml")]
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
         self.paimon_schema(name)
     }
 
+    #[cfg(feature = "dml")]
     fn register_schema(
         &self,
         name: &str,
@@ -606,6 +710,7 @@ impl CatalogProvider for PaimonCatalogProvider {
         )
     }
 
+    #[cfg(feature = "dml")]
     fn deregister_schema(
         &self,
         name: &str,
@@ -642,6 +747,7 @@ impl CatalogProvider for PaimonCatalogProvider {
     }
 }
 
+#[cfg(feature = "dml")]
 impl PaimonCatalogProvider {
     /// List one namespace without loading persistent table providers or losing catalog errors.
     pub(super) async fn table_metadata(
@@ -786,7 +892,9 @@ impl PaimonCatalogProvider {
 /// access to table providers within a specific database.
 ///
 /// Tables are loaded lazily when accessed via the `table()` method.
+#[cfg_attr(not(feature = "dml"), derive(Clone))]
 pub struct PaimonSchemaProvider {
+    #[cfg(feature = "dml")]
     catalog_name: Option<String>,
     /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
@@ -794,26 +902,32 @@ pub struct PaimonSchemaProvider {
     database: String,
     /// Session-scoped dynamic options shared with the SQL context.
     dynamic_options: DynamicOptions,
+    #[cfg(feature = "dml")]
     /// Optional temporary in-memory provider for temp tables and views.
     temp_provider: Option<Arc<MemorySchemaProvider>>,
+    #[cfg(feature = "dml")]
     /// Table types populated together with `table_names` for metadata-only lookups.
     catalog_table_types: RwLock<HashMap<String, TableType>>,
     blob_reader_registry: BlobReaderRegistry,
+    #[cfg(feature = "dml")]
     session_state: Option<SessionStateProvider>,
     schema_force_view_types: bool,
+    #[cfg(feature = "dml")]
     /// Engines for table types served elsewhere; empty without routing.
     table_engines: TableEngines,
 }
 
 impl Debug for PaimonSchemaProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PaimonSchemaProvider")
-            .field("database", &self.database)
-            .field("has_temp_provider", &self.temp_provider.is_some())
-            .finish()
+        let mut debug = f.debug_struct("PaimonSchemaProvider");
+        debug.field("database", &self.database);
+        #[cfg(feature = "dml")]
+        debug.field("has_temp_provider", &self.temp_provider.is_some());
+        debug.finish_non_exhaustive()
     }
 }
 
+#[cfg(feature = "dml")]
 impl PaimonSchemaProvider {
     /// Creates a new [`PaimonSchemaProvider`].
     pub fn new(
@@ -850,6 +964,7 @@ impl PaimonSchemaProvider {
     }
 }
 
+#[cfg(feature = "dml")]
 impl PaimonSchemaProvider {
     /// Resolve a metadata function's source through normal table handling,
     /// without planning persistent view definitions. Temporary shadows remain
@@ -1127,6 +1242,25 @@ impl PaimonSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for PaimonSchemaProvider {
+    #[cfg(not(feature = "dml"))]
+    fn table_names(&self) -> Vec<String> {
+        let catalog = Arc::clone(&self.catalog);
+        let database = self.database.clone();
+        block_on_with_runtime(
+            async move {
+                catalog
+                    .list_tables(&database)
+                    .await
+                    .unwrap_or_else(|error| {
+                        log::error!("failed to list Paimon tables in '{database}': {error}");
+                        vec![]
+                    })
+            },
+            "paimon catalog access thread panicked",
+        )
+    }
+
+    #[cfg(feature = "dml")]
     fn table_names(&self) -> Vec<String> {
         let catalog = Arc::clone(&self.catalog);
         let database = self.database.clone();
@@ -1180,10 +1314,50 @@ impl SchemaProvider for PaimonSchemaProvider {
         names
     }
 
+    #[cfg(not(feature = "dml"))]
+    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let identifier = Identifier::new(&self.database, name);
+        let parsed = identifier
+            .parsed_object_name()
+            .map_err(to_datafusion_error)?;
+        if parsed.system_table().is_some() {
+            return Ok(None);
+        }
+        let base = Identifier::new(&self.database, parsed.table());
+        let options = self.dynamic_options.read().unwrap().clone();
+        await_with_runtime(async {
+            let loaded = match self.catalog.load_table(&base).await {
+                Ok(loaded) => loaded,
+                Err(paimon::Error::TableNotExist { .. }) => return Ok(None),
+                Err(error) => return Err(to_datafusion_error(error)),
+            };
+            let (table, _, _) = loaded_table_for_read(loaded, &identifier).await?;
+            let definition = build_table_definition(&table).ok();
+            let table = if options.is_empty() {
+                table
+            } else {
+                table
+                    .copy_with_time_travel(options)
+                    .await
+                    .map_err(to_datafusion_error)?
+            };
+            let provider = PaimonTableProvider::try_new_with_blob_reader_registry_and_definition(
+                table,
+                self.blob_reader_registry.clone(),
+                definition,
+            )?
+            .with_schema_force_view_types(self.schema_force_view_types)?;
+            Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
+        })
+        .await
+    }
+
+    #[cfg(feature = "dml")]
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         self.table_with_views(name, true).await
     }
 
+    #[cfg(feature = "dml")]
     async fn table_type(&self, name: &str) -> DFResult<Option<TableType>> {
         if let Some(temp) = &self.temp_provider {
             if let Some(table_type) = temp.table_type(name).await? {
@@ -1205,6 +1379,18 @@ impl SchemaProvider for PaimonSchemaProvider {
             .map(|table| table.map(|table| table.table_type()))
     }
 
+    #[cfg(not(feature = "dml"))]
+    fn table_exist(&self, name: &str) -> bool {
+        let provider = self.clone();
+        let name = name.to_owned();
+        block_on_with_runtime(
+            async move { provider.table(&name).await },
+            "paimon catalog access thread panicked",
+        )
+        .is_ok_and(|table| table.is_some())
+    }
+
+    #[cfg(feature = "dml")]
     fn table_exist(&self, name: &str) -> bool {
         if let Some(temp) = &self.temp_provider {
             if temp.table_exist(name) {
@@ -1333,6 +1519,7 @@ impl SchemaProvider for PaimonSchemaProvider {
         )
     }
 
+    #[cfg(feature = "dml")]
     fn register_table(
         &self,
         _name: String,
@@ -1343,6 +1530,7 @@ impl SchemaProvider for PaimonSchemaProvider {
         Ok(Some(table))
     }
 
+    #[cfg(feature = "dml")]
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         // View DDL can reach this callback for metadata tables.
         let object = system_tables::parse_object_name_for_datafusion(name)?;
@@ -1375,6 +1563,7 @@ impl SchemaProvider for PaimonSchemaProvider {
     }
 }
 
+#[cfg(feature = "dml")]
 fn enforce_view_schema(plan: LogicalPlan, view: &View) -> DFResult<LogicalPlan> {
     let declared_fields = view.schema().fields();
     let actual_fields = plan.schema().fields();
@@ -1414,8 +1603,10 @@ fn enforce_view_schema(plan: LogicalPlan, view: &View) -> DFResult<LogicalPlan> 
     LogicalPlanBuilder::from(plan).project(expressions)?.build()
 }
 
+#[cfg(feature = "dml")]
 const MAX_VIEW_DEPENDENCIES: usize = 64;
 
+#[cfg(feature = "dml")]
 async fn validate_view_dependencies(
     catalog: &Arc<dyn Catalog>,
     catalog_name: &str,
@@ -1471,6 +1662,7 @@ async fn validate_view_dependencies(
     Ok(())
 }
 
+#[cfg(feature = "dml")]
 fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Identifier>> {
     let regex_sql = crate::regex_operators::parseable_sql(view.query_for("datafusion"))?;
     let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
@@ -1521,12 +1713,15 @@ fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Id
     Ok(identifiers)
 }
 
+#[cfg(feature = "dml")]
 type SqlIdentifierKey = String;
 
+#[cfg(feature = "dml")]
 fn sql_identifier_key(identifier: &Ident) -> SqlIdentifierKey {
     IdentNormalizer::default().normalize(identifier.clone())
 }
 
+#[cfg(feature = "dml")]
 fn relation_identifier(
     relation: &ObjectName,
     catalog_name: &str,
@@ -1547,6 +1742,7 @@ fn relation_identifier(
     }
 }
 
+#[cfg(feature = "dml")]
 fn find_view_dependency_cycle(
     dependencies: &HashMap<Identifier, Vec<Identifier>>,
 ) -> Option<Vec<Identifier>> {
@@ -1587,7 +1783,7 @@ fn find_view_dependency_cycle(
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dml"))]
 mod tests {
     use super::*;
 

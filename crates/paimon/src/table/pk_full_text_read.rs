@@ -481,6 +481,7 @@ mod tests {
 mod read_tests {
     use super::*;
     use crate::arrow::build_target_arrow_schema;
+    use crate::arrow::format::parquet::write_parquet_fixture;
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{DataField, DataFileMeta, DataType, GlobalIndexMeta, IndexFileMeta, IntType};
@@ -495,9 +496,6 @@ mod read_tests {
     use futures::TryStreamExt;
     use paimon_ftindex_core::io::PosWriter;
     use paimon_ftindex_core::{FullTextIndexConfig, FullTextIndexWriter};
-    use paimon_mosaic_core::spec::COMPRESSION_NONE;
-    use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
-    use std::io;
     use std::sync::Arc;
 
     // Exercise the same shared result materialization as the public builder.
@@ -535,27 +533,6 @@ mod read_tests {
 
     // ---- helpers ----
 
-    struct MemOutputFile {
-        data: Vec<u8>,
-    }
-    impl MemOutputFile {
-        fn new() -> Self {
-            Self { data: Vec::new() }
-        }
-    }
-    impl OutputFile for MemOutputFile {
-        fn write(&mut self, data: &[u8]) -> io::Result<()> {
-            self.data.extend_from_slice(data);
-            Ok(())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-        fn pos(&self) -> u64 {
-            self.data.len() as u64
-        }
-    }
-
     fn id_field() -> DataField {
         DataField::new(0, "id".to_string(), DataType::Int(IntType::new()))
     }
@@ -565,24 +542,6 @@ mod read_tests {
     fn id_batch(ids: Vec<i32>) -> RecordBatch {
         let schema = build_target_arrow_schema(&id_fields()).unwrap();
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))]).unwrap()
-    }
-
-    fn write_mosaic(batch: &RecordBatch) -> Bytes {
-        let out = MemOutputFile::new();
-        let mut writer = MosaicWriter::new(
-            out,
-            batch.schema().as_ref(),
-            WriterOptions {
-                compression: COMPRESSION_NONE,
-                num_buckets: 2,
-                row_group_max_size: u64::MAX,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        writer.write_batch(batch).unwrap();
-        writer.close().unwrap();
-        Bytes::from(writer.output().data.to_vec())
     }
 
     /// Build a tiny full-text archive in memory via the core writer.
@@ -716,7 +675,7 @@ mod read_tests {
         )
     }
 
-    /// Build the physical mosaic + a single-file `DataSplit`, plus a predicate-free
+    /// Build the physical Parquet + a single-file `DataSplit`, plus a predicate-free
     /// `DataFileReader` projecting `id`. `deleted_rows`, when non-empty, attaches a DV.
     async fn build_data(
         file_io: &FileIO,
@@ -725,9 +684,9 @@ mod read_tests {
         deleted_rows: &[u32],
     ) -> (DataFileReader, DataSplit) {
         let bucket_path = format!("{table_path}/bucket-0");
-        let file_name = "d0.mosaic";
+        let file_name = "d0.parquet";
         let row_count = ids.len() as i64;
-        let data = write_mosaic(&id_batch(ids));
+        let data = write_parquet_fixture(&[id_batch(ids)]);
         write_bytes(
             file_io,
             &format!("{bucket_path}/{file_name}"),
@@ -788,10 +747,10 @@ mod read_tests {
                 .with_bucket(0)
                 .with_bucket_path("memory:/t/bucket-0".to_string())
                 .with_total_buckets(1)
-                .with_data_files(vec![data_file("d0.mosaic", 1, 4)])
+                .with_data_files(vec![data_file("d0.parquet", 1, 4)])
                 .build()
                 .unwrap(),
-            vec![ft_payload("ft-0", &[("d0.mosaic", 4)])],
+            vec![ft_payload("ft-0", &[("d0.parquet", 4)])],
             Vec::new(),
         )
         .unwrap();
@@ -799,11 +758,11 @@ mod read_tests {
         // Out-of-order candidates; scores must survive verbatim, aligned to
         // ascending position order (no distance_to_score transform).
         let cands = vec![
-            PrimaryKeyFullTextCandidate::new(0, BinaryRow::new(0), 0, 0.1, "d0.mosaic".into(), 3)
+            PrimaryKeyFullTextCandidate::new(0, BinaryRow::new(0), 0, 0.1, "d0.parquet".into(), 3)
                 .unwrap(),
-            PrimaryKeyFullTextCandidate::new(0, BinaryRow::new(0), 0, 0.9, "d0.mosaic".into(), 0)
+            PrimaryKeyFullTextCandidate::new(0, BinaryRow::new(0), 0, 0.9, "d0.parquet".into(), 0)
                 .unwrap(),
-            PrimaryKeyFullTextCandidate::new(0, BinaryRow::new(0), 0, 0.5, "d0.mosaic".into(), 2)
+            PrimaryKeyFullTextCandidate::new(0, BinaryRow::new(0), 0, 0.5, "d0.parquet".into(), 2)
                 .unwrap(),
         ];
         let out = build_full_text_indexed_splits(cands, std::slice::from_ref(&split)).unwrap();
@@ -825,17 +784,17 @@ mod read_tests {
                 .with_bucket(0)
                 .with_bucket_path("memory:/t/bucket-0".to_string())
                 .with_total_buckets(1)
-                .with_data_files(vec![data_file("d0.mosaic", 1, 4)])
+                .with_data_files(vec![data_file("d0.parquet", 1, 4)])
                 .build()
                 .unwrap(),
-            vec![ft_payload("ft-0", &[("d0.mosaic", 4)])],
+            vec![ft_payload("ft-0", &[("d0.parquet", 4)])],
             Vec::new(),
         )
         .unwrap();
         let cands = vec![
-            PrimaryKeyFullTextCandidate::new(0, BinaryRow::new(0), 0, 0.9, "d0.mosaic".into(), 1)
+            PrimaryKeyFullTextCandidate::new(0, BinaryRow::new(0), 0, 0.9, "d0.parquet".into(), 1)
                 .unwrap(),
-            PrimaryKeyFullTextCandidate::new(0, BinaryRow::new(0), 0, 0.5, "d0.mosaic".into(), 1)
+            PrimaryKeyFullTextCandidate::new(0, BinaryRow::new(0), 0, 0.5, "d0.parquet".into(), 1)
                 .unwrap(),
         ];
         assert!(build_full_text_indexed_splits(cands, std::slice::from_ref(&split)).is_err());
@@ -860,7 +819,7 @@ mod read_tests {
             snapshot_id: 1,
             splits: vec![PrimaryKeyFullTextSearchSplit::new(
                 split,
-                vec![ft_payload("ft-0", &[("d0.mosaic", 4)])],
+                vec![ft_payload("ft-0", &[("d0.parquet", 4)])],
                 Vec::new(),
             )
             .unwrap()],
@@ -922,7 +881,7 @@ mod read_tests {
             snapshot_id: 1,
             splits: vec![PrimaryKeyFullTextSearchSplit::new(
                 split,
-                vec![ft_payload("ft-0", &[("d0.mosaic", 4)])],
+                vec![ft_payload("ft-0", &[("d0.parquet", 4)])],
                 Vec::new(),
             )
             .unwrap()],
@@ -953,7 +912,7 @@ mod read_tests {
             snapshot_id: 1,
             splits: vec![PrimaryKeyFullTextSearchSplit::new(
                 split,
-                vec![ft_payload("ft-0", &[("d0.mosaic", 2)])],
+                vec![ft_payload("ft-0", &[("d0.parquet", 2)])],
                 Vec::new(),
             )
             .unwrap()],
@@ -988,7 +947,7 @@ mod read_tests {
             snapshot_id: 1,
             splits: vec![PrimaryKeyFullTextSearchSplit::new(
                 split,
-                vec![ft_payload("ft-0", &[("d0.mosaic", 4)])],
+                vec![ft_payload("ft-0", &[("d0.parquet", 4)])],
                 Vec::new(),
             )
             .unwrap()],
@@ -1039,7 +998,7 @@ mod read_tests {
             snapshot_id: 1,
             splits: vec![PrimaryKeyFullTextSearchSplit::new(
                 split,
-                vec![ft_payload("ft-0", &[("d0.mosaic", 2)])],
+                vec![ft_payload("ft-0", &[("d0.parquet", 2)])],
                 Vec::new(),
             )
             .unwrap()],

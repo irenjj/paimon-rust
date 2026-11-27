@@ -390,9 +390,8 @@ pub(in crate::table) fn emit_multivalue_rows(
                     )
                 }
                 ArrayLayout::Fixed(array) => {
-                    let start = usize::try_from(array.value_offset(row));
-                    let end = usize::try_from(array.value_offset(row) + array.value_length());
-                    (start, end)
+                    let start = array.value_offset_at(row);
+                    (Ok(start), Ok(start + array.value_length() as usize))
                 }
             };
             let (start, end) = match (start, end) {

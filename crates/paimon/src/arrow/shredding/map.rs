@@ -1142,8 +1142,12 @@ impl MapShreddingReadPlan {
             let arrow_field = file_schema.field_with_name(field.name()).ok();
             let field_meta = arrow_field
                 .map(|arrow_field| arrow_field.metadata())
-                .filter(|metadata| has_shredding_metadata(Some(metadata)))
-                .map(deserialize_metadata)
+                .filter(|metadata| {
+                    metadata
+                        .get(MAP_STORAGE_LAYOUT_KEY)
+                        .is_some_and(|layout| layout == MAP_STORAGE_LAYOUT_SHARED_SHREDDING)
+                })
+                .map(|metadata| deserialize_metadata(&HashMap::from(metadata)))
                 .transpose()?;
             match (field_meta, field.data_type()) {
                 (Some(field_meta), DataType::Map(map_type)) => {

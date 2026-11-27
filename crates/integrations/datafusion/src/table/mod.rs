@@ -17,27 +17,33 @@
 
 //! Paimon table provider for DataFusion.
 
+#[cfg(feature = "dml")]
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef as ArrowSchemaRef};
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{
-    DataType as ArrowDataType, Field, Schema, SchemaRef as ArrowSchemaRef,
-};
-use datafusion::catalog::Session;
-use datafusion::common::DFSchemaRef;
+#[cfg(feature = "dml")]
 use datafusion::datasource::sink::DataSinkExec;
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::{DataFusionError, Result as DFResult};
+#[cfg(feature = "dml")]
 use datafusion::logical_expr::dml::{InsertOp, MergeIntoClause};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion_catalog::TableProvider;
+#[cfg(feature = "dml")]
+use datafusion_common::DFSchemaRef;
+use datafusion_common::{DataFusionError, Result as DFResult};
+use datafusion_expr::TableType;
+use datafusion_expr::{Expr, TableProviderFilterPushDown};
+use datafusion_physical_plan::ExecutionPlan;
+use datafusion_session::Session;
+#[cfg(feature = "dml")]
+use paimon::spec::Snapshot;
 use paimon::spec::{
-    BigIntType, CoreOptions, DataField, DataType, Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
 use paimon::table::Table;
 
+#[cfg(feature = "dml")]
 use crate::physical_plan::PaimonDataSink;
 use crate::BlobReaderRegistry;
 
@@ -48,7 +54,9 @@ use crate::filter_pushdown::{analyze_filters, classify_filter_pushdown};
 use crate::physical_plan::PaimonTableScan;
 use crate::runtime::await_with_runtime;
 
+#[cfg(feature = "dml")]
 mod object;
+#[cfg(feature = "dml")]
 pub(crate) use object::ObjectTableProvider;
 
 const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
@@ -115,7 +123,7 @@ fn query_auth_output_schema(table: &Table, schema: ArrowSchemaRef) -> ArrowSchem
     ))
 }
 
-/// Table provider for Paimon scans, INSERT, and native MERGE execution.
+/// Table provider for read-only Paimon scans.
 ///
 /// Supports full table scan, column projection, and predicate pushdown for
 /// planning. Partition predicates prune splits eagerly, while supported
@@ -195,11 +203,13 @@ impl PaimonTableProvider {
         &self.table
     }
 
+    #[cfg(feature = "dml")]
     pub(crate) fn with_pinned_snapshot(mut self, snapshot: &Snapshot) -> Self {
         self.table = self.table.copy_with_pinned_snapshot(Some(snapshot));
         self
     }
 
+    #[cfg(feature = "dml")]
     pub(crate) fn with_primary_key_mutation_snapshot(
         mut self,
         snapshot: Option<&Snapshot>,
@@ -406,7 +416,7 @@ pub(crate) struct PaimonScanBuilder<'a> {
     pub(crate) table: &'a Table,
     pub(crate) schema: &'a ArrowSchemaRef,
     pub(crate) plan: paimon::table::Plan,
-    pub(crate) projection: Option<&'a Vec<usize>>,
+    pub(crate) projection: Option<&'a [usize]>,
     pub(crate) pushed_predicate: Option<paimon::spec::Predicate>,
     pub(crate) limit: Option<usize>,
     pub(crate) target_partitions: usize,
@@ -490,7 +500,7 @@ impl TableProvider for PaimonTableProvider {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -555,6 +565,7 @@ impl TableProvider for PaimonTableProvider {
         .build()
     }
 
+    #[cfg(feature = "dml")]
     async fn insert_into(
         &self,
         _state: &dyn Session,
@@ -580,6 +591,7 @@ impl TableProvider for PaimonTableProvider {
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
 
+    #[cfg(feature = "dml")]
     async fn merge_into(
         &self,
         state: &dyn Session,
@@ -618,9 +630,10 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use datafusion::datasource::TableProvider;
-    use datafusion::logical_expr::{col, lit, Expr};
-    use datafusion::prelude::{SessionConfig, SessionContext};
+    use crate::test_session::TestSession;
+    use datafusion_catalog::TableProvider;
+    use datafusion_execution::config::SessionConfig;
+    use datafusion_expr::{col, lit, Expr};
     use paimon::catalog::Identifier;
     use paimon::spec::{ArrayType, MapType, RowType, VarCharType};
     use paimon::{Catalog, DataSplit};
@@ -678,8 +691,7 @@ mod tests {
         limit: Option<usize>,
     ) -> Arc<dyn ExecutionPlan> {
         let config = SessionConfig::new().with_target_partitions(8);
-        let ctx = SessionContext::new_with_config(config);
-        let state = ctx.state();
+        let state = TestSession::new(config);
         provider
             .scan(&state, None, &filters, limit)
             .await
@@ -1073,8 +1085,7 @@ mod tests {
         let filter = col("id").gt(lit(1));
 
         let config = SessionConfig::new().with_target_partitions(8);
-        let ctx = SessionContext::new_with_config(config);
-        let state = ctx.state();
+        let state = TestSession::new(config);
         let plan = provider
             .scan(&state, None, std::slice::from_ref(&filter), None)
             .await
@@ -1110,8 +1121,7 @@ mod tests {
     async fn test_scan_applies_projection_to_data_evolution_planning() {
         let provider = data_evolution_projection_pruning_provider().await;
         let config = SessionConfig::new().with_target_partitions(8);
-        let ctx = SessionContext::new_with_config(config);
-        let state = ctx.state();
+        let state = TestSession::new(config);
 
         let full_plan = provider
             .scan(&state, None, &[], None)
@@ -1184,6 +1194,13 @@ mod tests {
                 .sum::<usize>()
         );
     }
+}
+
+#[cfg(all(test, feature = "dml"))]
+mod dml_tests {
+    use super::*;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use paimon::catalog::Identifier;
 
     #[tokio::test]
     async fn test_insert_into_and_read_back() {

@@ -20,8 +20,11 @@ mod avro_write;
 pub(crate) mod blob;
 mod delta_varint;
 mod metadata_cache;
+#[cfg(feature = "format-mosaic")]
 mod mosaic;
+#[cfg(feature = "format-mosaic")]
 mod mosaic_write;
+#[cfg(feature = "format-orc")]
 mod orc;
 pub(crate) mod parquet;
 mod row;
@@ -32,7 +35,27 @@ pub(crate) mod video;
 #[cfg(feature = "vortex")]
 mod vortex;
 
-pub(crate) use mosaic::MosaicPrefetchOptions;
+const DEFAULT_PREFETCH_ROW_GROUPS: usize = 8;
+const DEFAULT_PREFETCH_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Row-group prefetch settings of one Mosaic file read, from the table options
+/// `mosaic.read.prefetch-row-groups` and `mosaic.read.prefetch-max-bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MosaicPrefetchOptions {
+    /// Row groups kept opening ahead of the consumer; `0` reads on demand.
+    pub row_groups: usize,
+    /// Estimated decoded bytes allowed in flight beyond the head row group.
+    pub max_bytes: usize,
+}
+
+impl Default for MosaicPrefetchOptions {
+    fn default() -> Self {
+        Self {
+            row_groups: DEFAULT_PREFETCH_ROW_GROUPS,
+            max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
+        }
+    }
+}
 #[cfg(test)]
 pub(crate) use parquet::ParquetFormatWriter;
 
@@ -365,7 +388,9 @@ pub(crate) async fn read_file_row_count(
                 .map(Some)
         }
         // Hive's zero-byte ORC outputs contain no rows, as in Format Table scans.
+        #[cfg(feature = "format-orc")]
         "orc" if file_size == 0 => Ok(Some(0)),
+        #[cfg(feature = "format-orc")]
         "orc" => {
             let reader = file_io.new_input(path)?.reader().await?;
             orc::read_row_count(Box::new(reader), file_size)
@@ -442,6 +467,8 @@ pub(crate) fn create_format_reader_with_budget(
     mosaic_prefetch: MosaicPrefetchOptions,
 ) -> crate::Result<ConfiguredFormatReader> {
     let lower = path.to_ascii_lowercase();
+    #[cfg(not(feature = "format-mosaic"))]
+    let _ = mosaic_prefetch;
     let reader: Box<dyn FormatFileReader> = if lower.ends_with(".parquet") {
         Box::new(parquet::ParquetFormatReader::with_options(
             table_options,
@@ -456,7 +483,14 @@ pub(crate) fn create_format_reader_with_budget(
     } else if lower.ends_with(".video") {
         Box::new(video::VideoFormatReader::new(path.to_string()))
     } else if lower.ends_with(".orc") {
-        Box::new(orc::OrcFormatReader)
+        #[cfg(feature = "format-orc")]
+        {
+            Box::new(orc::OrcFormatReader)
+        }
+        #[cfg(not(feature = "format-orc"))]
+        return Err(Error::Unsupported {
+            message: format!("reading {path} requires the format-orc feature"),
+        });
     } else if let Some((kind, compression)) = text::TextKind::from_path(path) {
         Box::new(text::TextFormatReader::new(
             kind,
@@ -468,7 +502,14 @@ pub(crate) fn create_format_reader_with_budget(
     } else if lower.ends_with(".row") {
         Box::new(row::RowFormatReader::with_options(table_options))
     } else if lower.ends_with(".mosaic") {
-        Box::new(mosaic::MosaicFormatReader::with_prefetch(mosaic_prefetch))
+        #[cfg(feature = "format-mosaic")]
+        {
+            Box::new(mosaic::MosaicFormatReader::with_prefetch(mosaic_prefetch))
+        }
+        #[cfg(not(feature = "format-mosaic"))]
+        return Err(Error::Unsupported {
+            message: format!("reading {path} requires the format-mosaic feature"),
+        });
     } else {
         #[cfg(feature = "vortex")]
         if lower.ends_with(".vortex") {
@@ -503,12 +544,14 @@ fn supported_read_formats() -> Vec<&'static str> {
         ".parquet",
         ".blob",
         ".video",
+        #[cfg(feature = "format-orc")]
         ".orc",
         ".csv",
         ".json",
         ".text",
         ".avro",
         ".row",
+        #[cfg(feature = "format-mosaic")]
         ".mosaic",
         #[cfg(feature = "vortex")]
         ".vortex",
@@ -520,12 +563,14 @@ fn supported_write_formats() -> Vec<&'static str> {
         ".parquet",
         ".blob",
         ".video",
+        #[cfg(feature = "format-orc")]
         ".orc",
         ".csv",
         ".json",
         ".text",
         ".avro",
         ".row",
+        #[cfg(feature = "format-mosaic")]
         ".mosaic",
         #[cfg(feature = "vortex")]
         ".vortex",
@@ -659,17 +704,24 @@ impl FormatWriterFactory for PlainFormatWriterFactory {
         let path = output.location();
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".orc") {
-            if !matches!(
-                compression.to_ascii_lowercase().as_str(),
-                "" | "none" | "uncompressed"
-            ) {
-                return Err(Error::Unsupported {
-                    message: format!(
-                        "ORC compression '{compression}' is not supported by the current writer"
-                    ),
-                });
+            #[cfg(feature = "format-orc")]
+            {
+                if !matches!(
+                    compression.to_ascii_lowercase().as_str(),
+                    "" | "none" | "uncompressed"
+                ) {
+                    return Err(Error::Unsupported {
+                        message: format!(
+                            "ORC compression '{compression}' is not supported by the current writer"
+                        ),
+                    });
+                }
+                Ok(Box::new(orc::OrcFormatWriter::new(output, schema).await?))
             }
-            Ok(Box::new(orc::OrcFormatWriter::new(output, schema).await?))
+            #[cfg(not(feature = "format-orc"))]
+            Err(Error::Unsupported {
+                message: format!("writing {path} requires the format-orc feature"),
+            })
         } else if let Some((kind, path_compression)) = text::TextKind::from_path(path) {
             let compression = text::TextCompression::from_name(compression)?;
             if compression != path_compression {
@@ -709,17 +761,24 @@ impl FormatWriterFactory for PlainFormatWriterFactory {
                 row::RowFormatWriter::new(output, schema, row_type, zstd_level).await?,
             ))
         } else if lower.ends_with(".mosaic") {
-            Ok(Box::new(
-                mosaic_write::MosaicFormatWriter::new(
-                    output,
-                    schema,
-                    compression,
-                    zstd_level,
-                    write_fields,
-                    format_options,
-                )
-                .await?,
-            ))
+            #[cfg(feature = "format-mosaic")]
+            {
+                Ok(Box::new(
+                    mosaic_write::MosaicFormatWriter::new(
+                        output,
+                        schema,
+                        compression,
+                        zstd_level,
+                        write_fields,
+                        format_options,
+                    )
+                    .await?,
+                ))
+            }
+            #[cfg(not(feature = "format-mosaic"))]
+            Err(Error::Unsupported {
+                message: format!("writing {path} requires the format-mosaic feature"),
+            })
         } else {
             #[cfg(feature = "vortex")]
             if lower.ends_with(".vortex") {
@@ -867,7 +926,9 @@ mod tests {
         for (path, expected) in [
             ("data.row", data_schema_fields.as_slice()),
             ("data.parquet", projected_fields),
+            #[cfg(feature = "format-orc")]
             ("data.orc", projected_fields),
+            #[cfg(feature = "format-mosaic")]
             ("data.mosaic", projected_fields),
         ] {
             let configured = create_format_reader_with_budget(
@@ -902,6 +963,7 @@ mod tests {
         let projected = vec![field(vec![child(2, "second")])];
         for path in [
             "data.parquet",
+            #[cfg(feature = "format-orc")]
             "data.orc",
             "data.avro",
             "data.json",
@@ -978,28 +1040,31 @@ mod tests {
             );
             assert!(!io.exists(&path).await.unwrap());
         }
-        // A default layout still reaches the existing ORC type validation;
-        // it must not be rejected as an unsupported shredding configuration.
-        let options = HashMap::from([("fields.tags.map.storage-layout".into(), "default".into())]);
-        let output = io.new_output("memory:/ordinary-map/data.orc").unwrap();
-        let error = create_format_writer(
-            &output,
-            schema,
-            "none",
-            0,
-            None,
-            Some(&fields),
-            Some(&options),
-        )
-        .await
-        .err()
-        .expect("ORC's existing writer does not support MAP columns");
-        assert!(
-            error
-                .to_string()
-                .contains("ORC writer does not support column"),
-            "{error}"
-        );
+        #[cfg(feature = "format-orc")]
+        {
+            // A default layout still reaches the existing ORC type validation.
+            let options =
+                HashMap::from([("fields.tags.map.storage-layout".into(), "default".into())]);
+            let output = io.new_output("memory:/ordinary-map/data.orc").unwrap();
+            let error = create_format_writer(
+                &output,
+                schema,
+                "none",
+                0,
+                None,
+                Some(&fields),
+                Some(&options),
+            )
+            .await
+            .err()
+            .expect("ORC's existing writer does not support MAP columns");
+            assert!(
+                error
+                    .to_string()
+                    .contains("ORC writer does not support column"),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::arrow::array::Array;
-use datafusion::arrow::datatypes::DataType as ArrowDataType;
-use datafusion::common::{Column, ScalarValue};
-use datafusion::logical_expr::expr::{InList, ScalarFunction};
-use datafusion::logical_expr::{
-    Between, BinaryExpr, Expr, Like, Operator, TableProviderFilterPushDown,
-};
+use arrow::array::Array;
+use arrow::datatypes::DataType as ArrowDataType;
+use datafusion_common::{Column, ScalarValue};
+use datafusion_expr::expr::{InList, ScalarFunction};
+use datafusion_expr::{Between, BinaryExpr, Expr, Like, Operator, TableProviderFilterPushDown};
 use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder};
 
 #[derive(Debug)]
@@ -329,6 +327,7 @@ impl<'a> FilterTranslator<'a> {
     }
 
     fn translate_scalar_function(&self, func: &ScalarFunction) -> Option<TranslatedPredicate> {
+        #[cfg(feature = "dml")]
         if func.func.inner().is::<crate::geospatial::BBoxIntersects>() {
             let [column, xmin, ymin, xmax, ymax] = func.args.as_slice() else {
                 return None;
@@ -811,13 +810,13 @@ fn scalar_to_i128(scalar: &ScalarValue) -> Option<i128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::common::Column;
-    use datafusion::logical_expr::{expr::InList, lit, TableProviderFilterPushDown};
+    use datafusion_common::Column;
+    use datafusion_expr::{expr::InList, lit, TableProviderFilterPushDown};
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
     use paimon::spec::{
         ArrayType, BigIntType, DoubleType, FloatType, IntType, LocalZonedTimestampType,
-        PredicateOperator, Schema, SmallIntType, TableSchema, TimeType, TimestampType, VarCharType,
+        PredicateOperator, Schema, TableSchema, TimeType, TimestampType, VarCharType,
     };
     use paimon::table::Table;
 
@@ -880,7 +879,7 @@ mod tests {
 
     #[test]
     fn test_float_zero_filters_fall_open_without_disabling_array_membership() {
-        use datafusion::functions_nested::expr_fn::array_has;
+        use datafusion_functions_nested::expr_fn::array_has;
 
         for (data_type, zeroes) in [
             (
@@ -967,7 +966,7 @@ mod tests {
 
     #[test]
     fn test_translate_datafusion_array_membership_functions() {
-        use datafusion::functions_nested::expr_fn::{
+        use datafusion_functions_nested::expr_fn::{
             array_has, array_has_all, array_has_any, make_array,
         };
 
@@ -1004,7 +1003,7 @@ mod tests {
 
     #[test]
     fn test_empty_array_has_all_falls_open_for_datafusion_null_semantics() {
-        use datafusion::functions_nested::expr_fn::{array_has_all, make_array};
+        use datafusion_functions_nested::expr_fn::{array_has_all, make_array};
 
         let filter = array_has_all(
             Expr::Column(Column::from_name("items")),
@@ -1021,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_float_array_membership_keeps_datafusion_residual() {
-        use datafusion::functions_nested::expr_fn::array_has;
+        use datafusion_functions_nested::expr_fn::array_has;
 
         let fields = vec![DataField::new(
             1,
@@ -1044,7 +1043,7 @@ mod tests {
 
     #[test]
     fn test_negated_inexact_float_array_membership_falls_open() {
-        use datafusion::functions_nested::expr_fn::array_has;
+        use datafusion_functions_nested::expr_fn::array_has;
 
         let fields = vec![DataField::new(
             1,
@@ -1068,9 +1067,9 @@ mod tests {
 
     #[test]
     fn test_translate_analyzer_inserted_array_widening_casts() {
-        use datafusion::arrow::datatypes::DataType as ArrowDataType;
-        use datafusion::functions_nested::expr_fn::{array_has, array_has_any, make_array};
-        use datafusion::logical_expr::Cast;
+        use arrow::datatypes::DataType as ArrowDataType;
+        use datafusion_expr::Cast;
+        use datafusion_functions_nested::expr_fn::{array_has, array_has_any, make_array};
 
         let fields = test_fields();
         let widened_items = Expr::Cast(Cast::new(
@@ -1175,6 +1174,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(test, feature = "dml"))]
     #[tokio::test]
     async fn test_translate_array_membership_after_datafusion_sql_analysis() {
         use datafusion::arrow::datatypes::{
@@ -1693,7 +1693,7 @@ mod tests {
     #[test]
     fn test_translate_starts_with_udf() {
         let fields = test_fields();
-        let filter = datafusion::functions::string::expr_fn::starts_with(
+        let filter = datafusion_functions::string::expr_fn::starts_with(
             Expr::Column(Column::from_name("dt")),
             lit("2024"),
         );
@@ -1711,7 +1711,7 @@ mod tests {
     #[test]
     fn test_translate_ends_with_udf() {
         let fields = test_fields();
-        let filter = datafusion::functions::string::expr_fn::ends_with(
+        let filter = datafusion_functions::string::expr_fn::ends_with(
             Expr::Column(Column::from_name("dt")),
             lit("01-01"),
         );
@@ -1728,7 +1728,7 @@ mod tests {
     #[test]
     fn test_translate_contains_udf() {
         let fields = test_fields();
-        let filter = datafusion::functions::string::expr_fn::contains(
+        let filter = datafusion_functions::string::expr_fn::contains(
             Expr::Column(Column::from_name("dt")),
             lit("01"),
         );
@@ -1746,7 +1746,7 @@ mod tests {
     fn test_translate_starts_with_on_non_string_column_falls_open() {
         let fields = test_fields();
         // `id` is Int — datum coercion fails and translation returns None.
-        let filter = datafusion::functions::string::expr_fn::starts_with(
+        let filter = datafusion_functions::string::expr_fn::starts_with(
             Expr::Column(Column::from_name("id")),
             lit("foo"),
         );

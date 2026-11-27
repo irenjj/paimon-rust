@@ -111,7 +111,7 @@ mod managed_blob_writer;
 #[cfg(test)]
 mod map_shredding_write_tests;
 pub(crate) mod merge_tree_split_generator;
-#[cfg(test)]
+#[cfg(all(test, feature = "format-mosaic"))]
 mod mosaic_table_write_tests;
 mod object_table;
 mod partition_filter;

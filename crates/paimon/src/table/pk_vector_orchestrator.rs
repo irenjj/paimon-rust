@@ -905,6 +905,7 @@ mod tests {
 mod e2e_tests {
     use super::*;
     use crate::arrow::build_target_arrow_schema;
+    use crate::arrow::format::parquet::write_parquet_fixture;
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
@@ -920,32 +921,8 @@ mod e2e_tests {
     use arrow_array::{Array, Float32Array, Int32Array, Int64Array, RecordBatch};
     use bytes::Bytes;
     use futures::TryStreamExt;
-    use paimon_mosaic_core::spec::COMPRESSION_NONE;
-    use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use roaring::RoaringBitmap;
     use std::collections::HashSet;
-    use std::io;
-
-    struct MemOutputFile {
-        data: Vec<u8>,
-    }
-    impl MemOutputFile {
-        fn new() -> Self {
-            Self { data: Vec::new() }
-        }
-    }
-    impl OutputFile for MemOutputFile {
-        fn write(&mut self, data: &[u8]) -> io::Result<()> {
-            self.data.extend_from_slice(data);
-            Ok(())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-        fn pos(&self) -> u64 {
-            self.data.len() as u64
-        }
-    }
 
     fn id_field() -> DataField {
         DataField::new(0, "id".to_string(), DataType::Int(IntType::new()))
@@ -982,24 +959,6 @@ mod e2e_tests {
             write_cols: None,
             column_max_sequence_numbers: None,
         }
-    }
-
-    fn write_mosaic_single_group(batch: &RecordBatch) -> Bytes {
-        let out = MemOutputFile::new();
-        let mut writer = MosaicWriter::new(
-            out,
-            batch.schema().as_ref(),
-            WriterOptions {
-                compression: COMPRESSION_NONE,
-                num_buckets: 2,
-                row_group_max_size: u64::MAX,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        writer.write_batch(batch).unwrap();
-        writer.close().unwrap();
-        Bytes::from(writer.output().data.to_vec())
     }
 
     async fn write_deletion_file(
@@ -1047,7 +1006,7 @@ mod e2e_tests {
         )
     }
 
-    /// Write one mosaic data file into a bucket path and return its `DataFileMeta`.
+    /// Write one Parquet data file into a bucket path and return its `DataFileMeta`.
     async fn write_file(
         file_io: &FileIO,
         bucket_path: &str,
@@ -1055,7 +1014,7 @@ mod e2e_tests {
         ids: Vec<i32>,
     ) -> DataFileMeta {
         let row_count = ids.len() as i64;
-        let data = write_mosaic_single_group(&id_batch(ids));
+        let data = write_parquet_fixture(&[id_batch(ids)]);
         file_io
             .new_output(&format!("{bucket_path}/{file_name}"))
             .unwrap()
@@ -1390,14 +1349,14 @@ mod e2e_tests {
 
     #[tokio::test]
     async fn single_bucket_ann_plus_exact_merge_materializes_with_position_and_score() {
-        // One bucket, two files: "ann.mosaic" is ANN-covered (FakeAnn hit at pos 1,
-        // distance 0.25); "exact.mosaic" is exact fallback (ArrayReader). Covered
+        // One bucket, two files: "ann.parquet" is ANN-covered (FakeAnn hit at pos 1,
+        // distance 0.25); "exact.parquet" is exact fallback (ArrayReader). Covered
         // files are NOT re-scanned by the exact fallback.
         let table_path = "memory:/pkvo_single";
         let bucket_path = format!("{table_path}/bucket-0");
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let ann_meta = write_file(&file_io, &bucket_path, "ann.mosaic", vec![100, 101, 102]).await;
-        let exact_meta = write_file(&file_io, &bucket_path, "exact.mosaic", vec![200, 201]).await;
+        let ann_meta = write_file(&file_io, &bucket_path, "ann.parquet", vec![100, 101, 102]).await;
+        let exact_meta = write_file(&file_io, &bucket_path, "exact.parquet", vec![200, 201]).await;
 
         let data_split = DataSplitBuilder::new()
             .with_snapshot(1)
@@ -1410,20 +1369,20 @@ mod e2e_tests {
             .unwrap();
         let split = PkVectorSearchSplit {
             data_split,
-            ann_segments: vec![ann_segment(&[("ann.mosaic", 3)])],
-            active_files: vec![active("ann.mosaic", 3), active("exact.mosaic", 2)],
+            ann_segments: vec![ann_segment(&[("ann.parquet", 3)])],
+            active_files: vec![active("ann.parquet", 3), active("exact.parquet", 2)],
         };
 
         let ann = FakeAnn {
             hits: vec![PkVectorSearchResult {
-                data_file_name: "ann.mosaic".to_string(),
+                data_file_name: "ann.parquet".to_string(),
                 row_position: 1,
                 distance: 0.25,
             }],
         };
-        // Exact fallback scans only "exact.mosaic": pos0 {1,0} d=1.0, pos1 {2,0} d=4.0.
+        // Exact fallback scans only "exact.parquet": pos0 {1,0} d=1.0, pos1 {2,0} d=4.0.
         let factory = file_array_search(|file_name| match file_name {
-            "exact.mosaic" => vec![Some(vec![1.0, 0.0]), Some(vec![2.0, 0.0])],
+            "exact.parquet" => vec![Some(vec![1.0, 0.0]), Some(vec![2.0, 0.0])],
             other => panic!("unexpected exact scan of covered file {other}"),
         });
         let opts = HashMap::new();
@@ -1441,7 +1400,7 @@ mod e2e_tests {
         .unwrap();
 
         // Output is ascending group (file name) then ascending position:
-        // ann.mosaic pos1 -> id 101; exact.mosaic pos0,1 -> ids 200,201.
+        // ann.parquet pos1 -> id 101; exact.parquet pos0,1 -> ids 200,201.
         assert_eq!(collect_i32(&batches, "id"), vec![101, 200, 201]);
         assert_eq!(
             collect_i64(&batches, PKEY_VECTOR_POSITION_COLUMN),
@@ -1467,7 +1426,7 @@ mod e2e_tests {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
 
         let b0_path = format!("{table_path}/bucket-0");
-        let b0_meta = write_file(&file_io, &b0_path, "b0.mosaic", vec![10, 11, 12]).await;
+        let b0_meta = write_file(&file_io, &b0_path, "b0.parquet", vec![10, 11, 12]).await;
         let split0 = PkVectorSearchSplit {
             data_split: DataSplitBuilder::new()
                 .with_snapshot(1)
@@ -1479,11 +1438,11 @@ mod e2e_tests {
                 .build()
                 .unwrap(),
             ann_segments: Vec::new(),
-            active_files: vec![active("b0.mosaic", 3)],
+            active_files: vec![active("b0.parquet", 3)],
         };
 
         let b1_path = format!("{table_path}/bucket-1");
-        let b1_meta = write_file(&file_io, &b1_path, "b1.mosaic", vec![20, 21, 22]).await;
+        let b1_meta = write_file(&file_io, &b1_path, "b1.parquet", vec![20, 21, 22]).await;
         let split1 = PkVectorSearchSplit {
             data_split: DataSplitBuilder::new()
                 .with_snapshot(1)
@@ -1495,18 +1454,18 @@ mod e2e_tests {
                 .build()
                 .unwrap(),
             ann_segments: Vec::new(),
-            active_files: vec![active("b1.mosaic", 3)],
+            active_files: vec![active("b1.parquet", 3)],
         };
 
         // b0: x = 1,4,6 -> d = 1,16,36. b1: x = 2,3,5 -> d = 4,9,25.
         // Global best 3: d1 (b0 pos0 id10), d4 (b1 pos0 id20), d9 (b1 pos1 id21).
         let factory = file_array_search(|file_name| match file_name {
-            "b0.mosaic" => vec![
+            "b0.parquet" => vec![
                 Some(vec![1.0, 0.0]),
                 Some(vec![4.0, 0.0]),
                 Some(vec![6.0, 0.0]),
             ],
-            "b1.mosaic" => vec![
+            "b1.parquet" => vec![
                 Some(vec![2.0, 0.0]),
                 Some(vec![3.0, 0.0]),
                 Some(vec![5.0, 0.0]),
@@ -1527,7 +1486,7 @@ mod e2e_tests {
         .await
         .unwrap();
 
-        // Ascending group order: bucket0 "b0.mosaic" pos0 -> 10; bucket1 "b1.mosaic"
+        // Ascending group order: bucket0 "b0.parquet" pos0 -> 10; bucket1 "b1.parquet"
         // pos0,1 -> 20,21.
         assert_eq!(collect_i32(&batches, "id"), vec![10, 20, 21]);
         assert_eq!(
@@ -1542,12 +1501,12 @@ mod e2e_tests {
 
     #[tokio::test]
     async fn dv_deleted_exact_position_is_absent_from_output() {
-        // Exact fallback over "d.mosaic" with a DV deleting position 1. The deleted
+        // Exact fallback over "d.parquet" with a DV deleting position 1. The deleted
         // position is absent; remaining position/score alignment holds.
         let table_path = "memory:/pkvo_dv";
         let bucket_path = format!("{table_path}/bucket-0");
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let meta = write_file(&file_io, &bucket_path, "d.mosaic", vec![30, 31, 32, 33]).await;
+        let meta = write_file(&file_io, &bucket_path, "d.parquet", vec![30, 31, 32, 33]).await;
         let df = write_deletion_file(&file_io, &format!("{table_path}/index/dv-0"), &[1]).await;
         let data_split = DataSplitBuilder::new()
             .with_snapshot(1)
@@ -1562,12 +1521,12 @@ mod e2e_tests {
         let split = PkVectorSearchSplit {
             data_split,
             ann_segments: Vec::new(),
-            active_files: vec![active("d.mosaic", 4)],
+            active_files: vec![active("d.parquet", 4)],
         };
 
         // pos0 {1,0} d=1, pos1 {2,0} d=4 (DELETED), pos2 {3,0} d=9, pos3 {0,0} d=0.
         let factory = file_array_search(|file_name| match file_name {
-            "d.mosaic" => vec![
+            "d.parquet" => vec![
                 Some(vec![1.0, 0.0]),
                 Some(vec![2.0, 0.0]),
                 Some(vec![3.0, 0.0]),
@@ -1608,7 +1567,7 @@ mod e2e_tests {
         let table_path = "memory:/pkvo_order";
         let bucket_path = format!("{table_path}/bucket-0");
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let meta = write_file(&file_io, &bucket_path, "o.mosaic", vec![40, 41, 42]).await;
+        let meta = write_file(&file_io, &bucket_path, "o.parquet", vec![40, 41, 42]).await;
         let split = PkVectorSearchSplit {
             data_split: DataSplitBuilder::new()
                 .with_snapshot(1)
@@ -1620,12 +1579,12 @@ mod e2e_tests {
                 .build()
                 .unwrap(),
             ann_segments: Vec::new(),
-            active_files: vec![active("o.mosaic", 3)],
+            active_files: vec![active("o.parquet", 3)],
         };
 
         // pos0 {3,0} d=9, pos1 {1,0} d=1, pos2 {2,0} d=4. Best-first = [1,2,0].
         let factory = file_array_search(|file_name| match file_name {
-            "o.mosaic" => vec![
+            "o.parquet" => vec![
                 Some(vec![3.0, 0.0]),
                 Some(vec![1.0, 0.0]),
                 Some(vec![2.0, 0.0]),
@@ -1665,7 +1624,7 @@ mod e2e_tests {
         let table_path = "memory:/pkvo_candidates";
         let bucket_path = format!("{table_path}/bucket-0");
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let meta = write_file(&file_io, &bucket_path, "c.mosaic", vec![1, 2, 3]).await;
+        let meta = write_file(&file_io, &bucket_path, "c.parquet", vec![1, 2, 3]).await;
         let split = PkVectorSearchSplit {
             data_split: DataSplitBuilder::new()
                 .with_snapshot(1)
@@ -1677,7 +1636,7 @@ mod e2e_tests {
                 .build()
                 .unwrap(),
             ann_segments: Vec::new(),
-            active_files: vec![active("c.mosaic", 3)],
+            active_files: vec![active("c.parquet", 3)],
         };
         // pos0 {3,0} d=9, pos1 {1,0} d=1, pos2 {2,0} d=4.
         let factory = as_split_search(
@@ -1689,7 +1648,7 @@ mod e2e_tests {
              exact_limit: usize,
              is_excluded: &(dyn Fn(i64) -> bool + Sync)|
              -> ExactFileSearchFuture<'_> {
-                assert_eq!(file.file_name, "c.mosaic");
+                assert_eq!(file.file_name, "c.parquet");
                 let file_name = file.file_name.clone();
                 let query = queries[0].to_vec();
                 Box::pin(async move {
@@ -1752,7 +1711,7 @@ mod e2e_tests {
         let table_path = "memory:/pkvo_residual";
         let bucket_path = format!("{table_path}/bucket-0");
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let meta = write_file(&file_io, &bucket_path, "r.mosaic", vec![1, 2, 3]).await;
+        let meta = write_file(&file_io, &bucket_path, "r.parquet", vec![1, 2, 3]).await;
         let split = PkVectorSearchSplit {
             data_split: DataSplitBuilder::new()
                 .with_snapshot(1)
@@ -1764,7 +1723,7 @@ mod e2e_tests {
                 .build()
                 .unwrap(),
             ann_segments: Vec::new(),
-            active_files: vec![active("r.mosaic", 3)],
+            active_files: vec![active("r.parquet", 3)],
         };
         // pos0 {3,0} d=9, pos1 {1,0} d=1, pos2 {2,0} d=4.
         let factory = as_split_search(
@@ -1776,7 +1735,7 @@ mod e2e_tests {
              exact_limit: usize,
              is_excluded: &(dyn Fn(i64) -> bool + Sync)|
              -> ExactFileSearchFuture<'_> {
-                assert_eq!(file.file_name, "r.mosaic");
+                assert_eq!(file.file_name, "r.parquet");
                 let file_name = file.file_name.clone();
                 let query = queries[0].to_vec();
                 Box::pin(async move {
@@ -1799,10 +1758,10 @@ mod e2e_tests {
                 })
             },
         );
-        // Allow only positions 0 and 2 for "r.mosaic"; pos1 (the best hit) is
+        // Allow only positions 0 and 2 for "r.parquet"; pos1 (the best hit) is
         // excluded by the residual.
         let row_ranges_by_split: Vec<RowRangesByFile> = vec![HashMap::from([(
-            "r.mosaic".to_string(),
+            "r.parquet".to_string(),
             vec![RowRange::new(0, 0), RowRange::new(2, 2)],
         )])];
         let opts = HashMap::new();
@@ -1842,7 +1801,7 @@ mod e2e_tests {
         let table_path = "memory:/pkvo_residual_mismatch";
         let bucket_path = format!("{table_path}/bucket-0");
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let meta = write_file(&file_io, &bucket_path, "m.mosaic", vec![1, 2]).await;
+        let meta = write_file(&file_io, &bucket_path, "m.parquet", vec![1, 2]).await;
         let split = PkVectorSearchSplit {
             data_split: DataSplitBuilder::new()
                 .with_snapshot(1)
@@ -1854,7 +1813,7 @@ mod e2e_tests {
                 .build()
                 .unwrap(),
             ann_segments: Vec::new(),
-            active_files: vec![active("m.mosaic", 2)],
+            active_files: vec![active("m.parquet", 2)],
         };
         let factory = unreachable_split_search();
         // Two residual maps for a single split.
@@ -1888,7 +1847,7 @@ mod e2e_tests {
         let table_path = "memory:/pkvo_fast";
         let bucket_path = format!("{table_path}/bucket-0");
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let meta = write_file(&file_io, &bucket_path, "f.mosaic", vec![1, 2]).await;
+        let meta = write_file(&file_io, &bucket_path, "f.parquet", vec![1, 2]).await;
         let split = PkVectorSearchSplit {
             data_split: DataSplitBuilder::new()
                 .with_snapshot(1)
@@ -1900,7 +1859,7 @@ mod e2e_tests {
                 .build()
                 .unwrap(),
             ann_segments: Vec::new(),
-            active_files: vec![active("f.mosaic", 2)],
+            active_files: vec![active("f.parquet", 2)],
         };
         let factory = unreachable_split_search();
         let opts = HashMap::new();
@@ -1996,7 +1955,7 @@ mod e2e_tests {
         let table_path = "memory:/pkvo_batch_one";
         let bucket_path = format!("{table_path}/bucket-0");
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let meta = write_file(&file_io, &bucket_path, "c.mosaic", vec![1, 2, 3]).await;
+        let meta = write_file(&file_io, &bucket_path, "c.parquet", vec![1, 2, 3]).await;
         let make_split = || PkVectorSearchSplit {
             data_split: DataSplitBuilder::new()
                 .with_snapshot(1)
@@ -2008,7 +1967,7 @@ mod e2e_tests {
                 .build()
                 .unwrap(),
             ann_segments: Vec::new(),
-            active_files: vec![active("c.mosaic", 3)],
+            active_files: vec![active("c.parquet", 3)],
         };
         // pos0 {3,0} d=9, pos1 {1,0} d=1, pos2 {2,0} d=4.
         let vectors = vec![
@@ -2075,7 +2034,7 @@ mod e2e_tests {
         let table_path = "memory:/pkvo_batch_indep";
         let bucket_path = format!("{table_path}/bucket-0");
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let meta = write_file(&file_io, &bucket_path, "c.mosaic", vec![1, 2, 3]).await;
+        let meta = write_file(&file_io, &bucket_path, "c.parquet", vec![1, 2, 3]).await;
         let split = PkVectorSearchSplit {
             data_split: DataSplitBuilder::new()
                 .with_snapshot(1)
@@ -2087,7 +2046,7 @@ mod e2e_tests {
                 .build()
                 .unwrap(),
             ann_segments: Vec::new(),
-            active_files: vec![active("c.mosaic", 3)],
+            active_files: vec![active("c.parquet", 3)],
         };
         // pos0 {3,0}, pos1 {1,0}, pos2 {2,0}.
         let vectors = vec![
@@ -2133,7 +2092,7 @@ mod e2e_tests {
         let mut splits = Vec::new();
         for bucket in 0..4i32 {
             let bucket_path = format!("{table_path}/bucket-{bucket}");
-            let meta = write_file(&file_io, &bucket_path, "d.mosaic", vec![bucket]).await;
+            let meta = write_file(&file_io, &bucket_path, "d.parquet", vec![bucket]).await;
             splits.push(PkVectorSearchSplit {
                 data_split: DataSplitBuilder::new()
                     .with_snapshot(1)
@@ -2145,7 +2104,7 @@ mod e2e_tests {
                     .build()
                     .unwrap(),
                 ann_segments: Vec::new(),
-                active_files: vec![active("d.mosaic", 1)],
+                active_files: vec![active("d.parquet", 1)],
             });
         }
         let visited = std::sync::Mutex::new(Vec::<usize>::new());
@@ -2210,7 +2169,7 @@ mod e2e_tests {
         let mut splits = Vec::new();
         for bucket in 0..4i32 {
             let bucket_path = format!("{table_path}/bucket-{bucket}");
-            let meta = write_file(&file_io, &bucket_path, "d.mosaic", vec![bucket, bucket]).await;
+            let meta = write_file(&file_io, &bucket_path, "d.parquet", vec![bucket, bucket]).await;
             splits.push(PkVectorSearchSplit {
                 data_split: DataSplitBuilder::new()
                     .with_snapshot(1)
@@ -2222,7 +2181,7 @@ mod e2e_tests {
                     .build()
                     .unwrap(),
                 ann_segments: Vec::new(),
-                active_files: vec![active("d.mosaic", 2)],
+                active_files: vec![active("d.parquet", 2)],
             });
         }
         // Each bucket's exact file yields the same two candidates: pos0 distance 1.0
@@ -2338,8 +2297,8 @@ mod e2e_tests {
         let mut splits = Vec::new();
         for bucket in 0..2i32 {
             let bucket_path = format!("{table_path}/bucket-{bucket}");
-            let meta_a = write_file(&file_io, &bucket_path, "a.mosaic", vec![bucket]).await;
-            let meta_b = write_file(&file_io, &bucket_path, "b.mosaic", vec![bucket]).await;
+            let meta_a = write_file(&file_io, &bucket_path, "a.parquet", vec![bucket]).await;
+            let meta_b = write_file(&file_io, &bucket_path, "b.parquet", vec![bucket]).await;
             splits.push(PkVectorSearchSplit {
                 data_split: DataSplitBuilder::new()
                     .with_snapshot(1)
@@ -2351,7 +2310,7 @@ mod e2e_tests {
                     .build()
                     .unwrap(),
                 ann_segments: Vec::new(),
-                active_files: vec![active("a.mosaic", 1), active("b.mosaic", 1)],
+                active_files: vec![active("a.parquet", 1), active("b.parquet", 1)],
             });
         }
 

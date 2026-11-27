@@ -145,22 +145,23 @@ pub(crate) async fn parquet_granules(
             source: None,
         });
     }
-    let Some(offset_index) = metadata
-        .offset_index()
-        .filter(|index| index.len() == metadata.row_groups().len())
-    else {
+    let Some(page_index) = metadata.page_index() else {
         return Ok((row_group_granules(&metadata, &columns), false));
     };
 
     let mut granules = Vec::new();
     let mut cursor = 0i64;
-    for (row_group, indexes) in metadata.row_groups().iter().zip(offset_index) {
+    for (row_group_idx, row_group) in metadata.row_groups().iter().enumerate() {
         let Ok(row_count) = usize::try_from(row_group.num_rows()) else {
             return Ok((row_group_granules(&metadata, &columns), false));
         };
         let Some(leaf_pages) = columns
             .iter()
-            .map(|index| indexes.get(*index).map(|index| index.page_locations()))
+            .map(|&column| {
+                page_index
+                    .offset_index(row_group_idx, column)
+                    .map(|index| index.page_locations())
+            })
             .collect::<Option<Vec<_>>>()
         else {
             return Ok((row_group_granules(&metadata, &columns), false));
@@ -2745,9 +2746,7 @@ fn build_predicate_page_selection(
     if predicates.is_empty() {
         return Ok(None);
     }
-    let (Some(column_index), Some(offset_index)) =
-        (metadata.column_index(), metadata.offset_index())
-    else {
+    let Some(page_index) = metadata.page_index().filter(|index| index.is_complete()) else {
         return Ok(None);
     };
     let row_groups = metadata.row_groups();
@@ -2787,20 +2786,16 @@ fn build_predicate_page_selection(
             // Missing page index for this column/row group: keep the whole group
             // (row-group pruning still applied).
             let (Some(col_index), Some(col_offset)) = (
-                column_index.get(rg_idx).and_then(|rg| rg.get(parquet_col)),
-                offset_index.get(rg_idx).and_then(|rg| rg.get(parquet_col)),
+                page_index.column_index(rg_idx, parquet_col),
+                page_index.offset_index(rg_idx, parquet_col),
             ) else {
                 ranges.push(base..base + rg_rows);
                 continue;
             };
             let pages = col_offset.page_locations();
-            // Fail open when the column index is absent for this chunk
-            // (`ColumnIndexMetaData::NONE` — its accessors panic rather than
-            // return `None`), when the two indexes disagree on the page count,
-            // or when the page row boundaries are malformed. Either way we
-            // cannot safely map page stats to row ranges.
+            // Keep the whole group if the indexes disagree on the page count
+            // or the page row boundaries are malformed.
             if pages.is_empty()
-                || matches!(col_index, ColumnIndexMetaData::NONE)
                 || col_index.num_pages() as usize != pages.len()
                 || !page_boundaries_valid(pages, rg_rows)
             {
@@ -3538,6 +3533,17 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
     }
 
     result
+}
+
+#[cfg(test)]
+pub(crate) fn write_parquet_fixture(batches: &[RecordBatch]) -> Bytes {
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(Vec::new(), batches[0].schema(), None).unwrap();
+    for batch in batches {
+        writer.write(batch).unwrap();
+        writer.flush().unwrap();
+    }
+    Bytes::from(writer.into_inner().unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -4478,8 +4484,8 @@ mod tests {
 
         let bytes = write_multi_page_parquet(10, 80).await;
         let metadata = load_metadata_with_page_index(&bytes, true);
-        let offset_index = &metadata.offset_index().unwrap()[0];
-        let page_locations = offset_index[0].page_locations();
+        let offset_index = metadata.page_index().unwrap().offset_index(0, 0).unwrap();
+        let page_locations = offset_index.page_locations();
         let compressed_bytes = page_locations
             .iter()
             .map(|page| i64::from(page.compressed_page_size))
@@ -5070,11 +5076,14 @@ mod tests {
         .unwrap();
         let metadata = reader.metadata().clone();
         assert!(metadata.num_row_groups() > 1);
-        let offsets = metadata.offset_index().expect("page index");
-        for (row_group, columns) in metadata.row_groups().iter().zip(offsets) {
+        let page_index = metadata.page_index().expect("page index");
+        for (row_group_index, row_group) in metadata.row_groups().iter().enumerate() {
             assert!(row_group.compressed_size() <= 2 * 16384);
-            for column in columns {
-                let firsts = column
+            for column_index in 0..row_group.num_columns() {
+                let offset_index = page_index
+                    .offset_index(row_group_index, column_index)
+                    .unwrap();
+                let firsts = offset_index
                     .page_locations()
                     .iter()
                     .map(|page| page.first_row_index)
@@ -5970,8 +5979,7 @@ mod tests {
         let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, false).await;
         let metadata = load_metadata_with_page_index(&bytes, false);
         assert_eq!(metadata.row_groups().len(), 2);
-        assert!(metadata.column_index().is_none());
-        assert!(metadata.offset_index().is_none());
+        assert!(metadata.page_index().is_none());
         let fields = vec![int_field("id"), int_field("value")];
 
         let outside = vec![id_leaf(
@@ -6122,7 +6130,7 @@ mod tests {
     async fn test_parquet_granules_uses_row_groups_when_page_index_disabled() {
         let bytes = Bytes::from(write_multi_page_parquet(10, 80).await);
         let metadata = load_metadata_with_page_index(&bytes, true);
-        assert!(metadata.offset_index().is_some());
+        assert!(metadata.page_index().unwrap().offset_index(0, 0).is_some());
         let (granules, page_level) = parquet_granules(
             Box::new(TrackingFileRead::new(bytes.clone())),
             bytes.len() as u64,
@@ -7052,7 +7060,8 @@ mod tests {
         writer.close().await.unwrap();
         let metadata = load_metadata_with_page_index(&data, true);
         assert_eq!(metadata.num_row_groups(), 4);
-        let pages = metadata.offset_index().unwrap()[0][0].page_locations();
+        let offset_index = metadata.page_index().unwrap().offset_index(0, 0).unwrap();
+        let pages = offset_index.page_locations();
         assert!(
             pages[1].compressed_page_size > pages[0].compressed_page_size * 100,
             "adjacent equal-row-count pages must have very different compression ratios"

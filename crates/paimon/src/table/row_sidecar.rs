@@ -164,7 +164,7 @@ pub(super) fn mark_blob_data(schema: &SchemaRef, names: &HashSet<String>) -> Sch
                 return field.clone();
             }
             let mut metadata = field.metadata().clone();
-            metadata.insert(BLOB_DATA.into(), "true".into());
+            metadata.insert(BLOB_DATA, "true");
             Arc::new(field.as_ref().clone().with_metadata(metadata))
         })
         .collect();

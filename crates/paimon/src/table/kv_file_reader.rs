@@ -1186,7 +1186,7 @@ impl KeyValueFileReader {
                         let reordered = RecordBatch::try_new_with_options(
                             if batch.schema().metadata().contains_key(CHANGELOG_BATCH_METADATA_KEY) {
                                 let mut metadata = output_schema.metadata().clone();
-                                metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
+                                metadata.insert(CHANGELOG_BATCH_METADATA_KEY, "true");
                                 Arc::new(output_schema.as_ref().clone().with_metadata(metadata))
                             } else { output_schema.clone() },
                             columns,

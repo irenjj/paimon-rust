@@ -1275,6 +1275,16 @@ mod tests {
             .open_blob(&java_v2_descriptor(&missing, 0, -1))
             .unwrap();
 
+        assert_eq!(
+            stream.seek(SeekFrom::Start(u64::MAX)).await.unwrap(),
+            u64::MAX
+        );
+        assert!(matches!(
+            stream.seek(SeekFrom::Current(1)).await,
+            Err(crate::Error::DataInvalid { .. })
+        ));
+        assert_eq!(stream.seek(SeekFrom::Current(0)).await.unwrap(), u64::MAX);
+        stream.seek(SeekFrom::Start(0)).await.unwrap();
         assert!(stream.read(0).await.unwrap().is_empty());
         let error = stream.read(1).await.unwrap_err().to_string();
         assert!(error.contains("input indices [0]"));
@@ -1283,6 +1293,9 @@ mod tests {
         assert!(reader.open_blob(&[]).is_err());
         assert!(reader
             .open_blob(&BlobDescriptor::new("file:///tmp/a".to_string(), -1, 1).serialize())
+            .is_err());
+        assert!(reader
+            .open_blob(&java_v2_descriptor(&missing, 0, -2))
             .is_err());
     }
 }

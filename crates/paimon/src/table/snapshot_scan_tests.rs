@@ -25,7 +25,7 @@ use common::incremental_helpers::{
 };
 use futures::TryStreamExt;
 use paimon::spec::{DataType, IntType, Schema, TableSchema};
-use paimon::table::{IncrementalScanMode, Plan, Table, TableScan};
+use paimon::table::{DataSplit, IncrementalScanMode, Plan, RowRange, Table, TableScan};
 use std::collections::HashMap;
 
 async fn table(name: &str, engine: &str, producer: &str, buckets: i32) -> Table {
@@ -107,6 +107,54 @@ async fn rows(table: &Table, plan: &Plan) -> Vec<(i32, i32)> {
     }
     rows.sort_unstable();
     rows
+}
+
+#[tokio::test]
+async fn parquet_scan_reads_row_ranges_after_split_json_round_trip() {
+    let path = "memory:/snapshot_scan/parquet_json";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .partition_keys(["value"])
+        .option("bucket", "-1")
+        .option("file.format", "parquet")
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![10, 20, 30, 40, 50], vec![7; 5])).await;
+
+    let ranges = [RowRange::new(1, 2), RowRange::new(4, 4)];
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_row_ranges(ranges.to_vec())
+        .plan()
+        .await
+        .unwrap();
+    let [split] = plan.splits() else {
+        panic!("expected one split, got {:?}", plan.splits());
+    };
+    assert_eq!(split.snapshot_id(), 1);
+    assert_eq!(split.partition().get_int(0).unwrap(), 7);
+    assert_eq!(split.bucket(), 0);
+    assert!(split.raw_convertible());
+    assert_eq!(split.row_ranges(), Some(ranges.as_slice()));
+    assert!(split.data_files()[0].file_name.ends_with(".parquet"));
+
+    let scores = [0.25, 1.0, 0.5];
+    let split = split.clone().with_scores(scores.to_vec()).unwrap();
+    let json = serde_json::to_vec(&split).unwrap();
+    let restored: DataSplit = serde_json::from_slice(&json).unwrap();
+    assert_eq!(restored.scores(), Some(scores.as_slice()));
+    assert_eq!(restored, split);
+    assert_eq!(
+        rows(&table, &Plan::new(vec![restored])).await,
+        [(20, 7), (30, 7), (50, 7)]
+    );
 }
 
 #[tokio::test]

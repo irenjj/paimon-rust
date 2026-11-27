@@ -164,9 +164,16 @@ async fn nested_projection_roundtrips_parquet_and_fallback_formats() {
     let source = fields(false);
     let input = input();
     let target = fields(true).into_iter().rev().collect::<Vec<_>>();
-    for extension in ["parquet", "orc", "avro", "row", "json"]
-        .into_iter()
-        .chain(cfg!(feature = "vortex").then_some("vortex"))
+    for extension in [
+        "parquet",
+        #[cfg(feature = "format-orc")]
+        "orc",
+        "avro",
+        "row",
+        "json",
+    ]
+    .into_iter()
+    .chain(cfg!(feature = "vortex").then_some("vortex"))
     {
         let source = if extension == "vortex" {
             source[..3].to_vec()

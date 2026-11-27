@@ -17,12 +17,13 @@
 
 use std::sync::Arc;
 
-use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion_common::{DataFusionError, Result as DFResult};
 use paimon::catalog::{Catalog, Identifier, LoadedTable};
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
 
+#[cfg(feature = "dml")]
 /// [`Catalog::get_table`] for paths that need a `Table` rather than a
 /// [`paimon::catalog::LoadedTable`], rejecting an engine-served declared
 /// type: `get_table` is a trait method, so a catalog outside this repository
@@ -39,8 +40,7 @@ pub(crate) async fn get_paimon_table(
     Ok(table)
 }
 
-/// The check from [`get_paimon_table`], for callers that already hold the
-/// table or special-case the `get_table` error.
+/// Rejects tables whose declared type requires a separate table engine.
 pub(crate) fn ensure_paimon_served(table: &Table, identifier: &Identifier) -> DFResult<()> {
     let declared = paimon::spec::CoreOptions::new(table.schema().options())
         .table_type()
